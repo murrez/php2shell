@@ -1,1 +1,4 @@
-# No third-party deps; stdlib only (socket/ssl).
+requests>=2.31.0
+rich>=13.7.0
+PySocks>=1.7.1
+beautifulsoup4>=4.12.0
