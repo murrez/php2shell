@@ -2,9 +2,9 @@
 
 [![Python](https://img.shields.io/badge/Python-3.8+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Authorized_Research_Only-CC0000?style=flat-square)](README.md#legal--ethical-disclaimer)
-[![Core CVEs](https://img.shields.io/badge/Core_CVEs-109618_|_109619_|_115560-FF6B35?style=flat-square)](#layer-1--php-core-engine)
+[![Core CVEs](https://img.shields.io/badge/Core_CVEs-109618_|_109619_|_115560_|_129474-FF6B35?style=flat-square)](#layer-1--php-core-engine)
 
-**php2shell** is a hybrid PHP security research framework that combines **pre-authentication PHP core attack-surface probing** (**CVE-2026-109618**, **CVE-2026-109619**, **CVE-2026-115560**) with **application-level upload handler discovery**, shell marker verification, and optional automated exploit chaining—including **Auto-LFI parameter discovery** for session-poisoning follow-through.
+**php2shell** is a hybrid PHP security research framework that combines **pre-authentication PHP core attack-surface probing** (**CVE-2026-109618**, **CVE-2026-109619**, **CVE-2026-115560**, **CVE-2026-129474**) with **application-level upload handler discovery**, shell marker verification, and optional automated exploit chaining—including **Auto-LFI parameter discovery** for session-poisoning follow-through and **PHP 8.5 magic-method backtrace** surface probes.
 
 The primary entry point is `poc.py`: a single-file, Rich-powered CLI suitable for single-target assessment and high-concurrency mass scanning.
 
@@ -53,12 +53,14 @@ Targets the PHP runtime **before application auth**:
 | **CVE-2026-109618** | OOM / memory-management corruption | Memory limit exhaustion, timing spikes, worker faults |
 | **CVE-2026-109619** | Stale global state / `session.upload_progress` | Progress-path artifacts, session handshake, destruction errors |
 | **CVE-2026-115560** | Session **serialize_handler** mismatch during upload progress | Handler decode failures, `php_serialize` / `php_binary` vs `php` transition errors, progress/serializer cross-talk |
+| **CVE-2026-129474** | Magic **`__call` / `__callStatic`** fatal backtrace UAF (PHP **8.5.0–&lt;8.5.13**) | OOM/limit during magic dispatch + stack trace args; large JSON/import paths; needs `fatal_error_backtraces=1` and `zend.exception_ignore_args=0` |
 
 Capabilities include:
 
 - Pre-auth `multipart/form-data` probes with `PHPSESSID` + `PHP_SESSION_UPLOAD_PROGRESS`
 - **Session Serialization Handler Mismatch & Transition Probe Engine** — shapes progress payloads and optional ini hints for runtime handler flips (`php_serialize`, `php_binary`, `php`, and two-step **transition** probes)
-- **Strict CVE mode** (`--strict-cve`): version patch gating + signature-specific classification for **109618 / 109619 / 115560**
+- **Strict CVE mode** (`--strict-cve`): version patch gating + signature-specific classification for **109618 / 109619 / 115560 / 129474**
+- **Backtrace probe** (`probe_backtrace_129474()`): oversized JSON POST to common import/API routes on **PHP 8.5.x &lt; 8.5.13** (default on; `--no-core-backtrace-probe`)
 - **Gradual OOM fuzz calibration** (256 KB → 8 MB tiers) to estimate memory thresholds
 - **SAPI profiling** (PHP-FPM, mod_php, CGI, FrankenPHP) with strategy auto-tuning
 - **Worker pinning** via keep-alive connection pools for FPM stale-state research
@@ -92,7 +94,7 @@ When Layer 1 does not yield an exploitable core chain:
 
 ## 🚀 Latest Updates & Changelog
 
-> **Latest engine release** — Core chain automation, **CVE-2026-115560** serialize-handler probing, environment-aware tuning, and operator-focused fast paths. Primary targets in `poc.py`: **109618** (OOM), **109619** (session / stale state), **115560** (serialize handler mismatch).
+> **Latest engine release** — Core chain automation, **CVE-2026-115560** serialize-handler probing, **CVE-2026-129474** backtrace surface probes (PHP 8.5), and operator fast paths. Primary targets in `poc.py`: **109618** (OOM), **109619** (session / stale state), **115560** (serialize handler), **129474** (magic backtrace UAF, 8.5 only).
 
 ### At a glance
 
@@ -102,6 +104,7 @@ When Layer 1 does not yield an exploitable core chain:
 | SAPI profiling | `detect_sapi_profile()` | On by default; `--no-sapi-auto` |
 | OOM calibration | `run_oom_fuzz_calibration()` | Full `--check`; off on `--core-chain` unless aggressive |
 | Serialize handler probes | `probe_serialize_handler_mismatch()` | On by default; `--no-core-serialize-probe` |
+| Backtrace / 129474 probe | `probe_backtrace_129474()` | PHP 8.5.x; on by default; `--no-core-backtrace-probe` |
 | Worker pinning | `configure_worker_pinning()` | FPM auto-tune; force `--core-worker-pin` |
 | Fast core chain | `run_core_chain_exploit_only()` | `--exploit --core-chain` (skips upload wordlist) |
 
@@ -487,7 +490,7 @@ python poc.py -f targets.txt --exploit -cmd "id" --threads 10 --exploit-log expl
 |------|-------------|
 | `--no-core-check` | App-only checks |
 | `--core-chain` | Automated session poison + LFI/FPM chain on `--exploit` |
-| `--strict-cve` | Patched-version skip + strict CVE signatures (109618, 109619, **115560**) |
+| `--strict-cve` | Patched-version skip + strict CVE signatures (109618, 109619, 115560, **129474**) |
 | `--core-padding` | Default multipart padding bytes (default: 512) |
 | `--core-aggressive` | Large probe body (~5120 bytes) |
 | `--core-adaptive` | PHP 8.1–8.5 branch sizing |
@@ -502,6 +505,7 @@ python poc.py -f targets.txt --exploit -cmd "id" --threads 10 --exploit-log expl
 | `--core-fpm-gap` | Delay between two-step requests (default: 0.12s) |
 | `--core-worker-pin` | Force single-connection keep-alive pool |
 | `--no-core-serialize-probe` | Disable **CVE-2026-115560** serialize-handler / upload-progress mismatch probes |
+| `--no-core-backtrace-probe` | Disable **CVE-2026-129474** large JSON backtrace surface probe (PHP 8.5.x only) |
 | `--core-serialize-mode` | Progress payload shaping: `auto`, `php`, `php_serialize`, `php_binary`, `transition` (default: `auto`) |
 | `--no-core-serialize-transition` | Skip the two-step `php_serialize`/`php_binary` → `php` transition follow-up POST |
 
@@ -560,8 +564,8 @@ Rich panels: **Core exploit chain planner** (includes **Serialize** row), **Auto
 1. **`--core-chain` fast path** skips upload wordlist scanning and duplicate hybrid passes; progress lines appear immediately (`stage_log`).
 2. **Core chain ≠ guaranteed RCE** on every host: Auto-LFI requires a real include/LFI primitive; otherwise you may only observe core **surface signals** (including serialize-handler discrepancies).
 3. **App upload verification** rejects shells that return raw PHP source (`application/octet-stream` / static mirrors).
-4. **Patched PHP:** baseline fixes for **109618/109619** (8.2.35+, 8.3.36+, 8.4.27+, 8.5.12+); **115560** serialize-handler fixes track **8.2.36+, 8.3.37+, 8.4.28+, 8.5.13+** in strict gating. Use **`--strict-cve`** to reduce noise.
-5. Long scans: use `--core-endpoint-only`, `--no-core-oom-fuzz`, `--no-core-serialize-probe` (if not researching 115560), and lower `--lfi-discover-max` on slow targets.
+4. **Patched PHP:** baseline fixes for **109618/109619** (8.2.35+, 8.3.36+, 8.4.27+, 8.5.12+); **115560** → **8.5.13+** (among branches); **129474** remote path → **PHP 8.5.13+** only. **`--strict-cve`** reduces noise; 8.5.12 may still run **129474** backtrace probes.
+5. Long scans: use `--core-endpoint-only`, `--no-core-oom-fuzz`, `--no-core-serialize-probe`, `--no-core-backtrace-probe` on slow targets, and lower `--lfi-discover-max`.
 
 ---
 
@@ -571,7 +575,7 @@ Rich panels: **Core exploit chain planner** (includes **Serialize** row), **Auto
 
 - Use only on systems you **own** or have **explicit written permission** to test.
 - Unauthorized access to computer systems is illegal in most jurisdictions.
-- CVE-2026-109618 / CVE-2026-109619 / **CVE-2026-115560** testing can **disrupt services** (OOM, worker crashes, session decode faults). Use isolated lab environments or approved maintenance windows when applicable.
+- CVE-2026-109618 / CVE-2026-109619 / **CVE-2026-115560** / **CVE-2026-129474** testing can **disrupt services** (OOM, worker crashes, session decode faults). Use isolated lab environments or approved maintenance windows when applicable.
 - The authors and contributors **assume no liability** for misuse, damage, or legal consequences arising from use of this software.
 
 By using php2shell, you agree to comply with all applicable laws and organizational policies.
@@ -594,6 +598,6 @@ By using php2shell, you agree to comply with all applicable laws and organizatio
 
 ## References
 
-Public research and advisories informing this tooling include PHP **CVE-2026-109618** (OOM corruption), **CVE-2026-109619** (stale global state / `session.upload_progress`), **CVE-2026-115560** (session **`serialize_handler`** mismatch during upload progress / runtime transitions), community PoC matrices, and PHP security release notes (8.2.35–36 / 8.3.36–37 / 8.4.27–28 / 8.5.12–13).
+Public research includes **CVE-2026-109618**, **CVE-2026-109619**, **CVE-2026-115560**, **CVE-2026-129474** ([GHSA-8mjj-2r7p-4hg2](https://github.com/php/php-src/security/advisories/GHSA-8mjj-2r7p-4hg2)), and PHP security releases through **8.5.13**.
 
 **Patch PHP. Restart workers. Disable untrusted upload paths. Test responsibly.**
